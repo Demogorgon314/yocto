@@ -69,13 +69,15 @@ RUN apt-get update && apt-get install -y \
 # Install pip for python2 and python3
 RUN curl https://bootstrap.pypa.io/pip/2.7/get-pip.py -o get-pip2.py \
     && python2 get-pip2.py \
-    && rm get-pip2.py
+    && rm get-pip2.py \
+    && apt-get update && apt-get install -y python3-pip && rm -rf /var/lib/apt/lists/*
 
 # Set python to use python2
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python2 1
 
-# Install Python packages
+# Install Python packages (for both python2 and python3)
 RUN pip2 install numpy pillow
+RUN pip3 install numpy
 
 # Install repo tool if not available via apt
 RUN curl https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo \
