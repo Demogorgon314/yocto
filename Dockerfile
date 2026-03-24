@@ -77,7 +77,7 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python2 1
 
 # Install Python packages (for both python2 and python3)
 RUN pip2 install numpy pillow
-RUN pip3 install numpy
+RUN pip3 install numpy pillow
 
 # Install repo tool if not available via apt
 RUN curl https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo \
