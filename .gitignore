@@ -1,0 +1,13 @@
+.templateconf
+build/
+downloads/
+sstate-cache/
+aml-comp/uboot/build/
+aml-comp/hardware/aml-5.15/amlogic/vfm_cap/*.cmd
+aml-comp/hardware/aml-5.15/amlogic/vfm_cap/*.ko
+aml-comp/hardware/aml-5.15/amlogic/vfm_cap/*.mod
+aml-comp/hardware/aml-5.15/amlogic/vfm_cap/*.mod.c
+aml-comp/hardware/aml-5.15/amlogic/vfm_cap/*.mod.o
+aml-comp/hardware/aml-5.15/amlogic/vfm_cap/*.o
+aml-comp/hardware/aml-5.15/amlogic/vfm_cap/Module.symvers
+aml-comp/hardware/aml-5.15/amlogic/vfm_cap/modules.order
