@@ -12,9 +12,11 @@ HDMI_PID_FILE="$REMOTE_STATE_DIR/hdmi.pid"
 UVC_PID_FILE="$REMOTE_STATE_DIR/uvc.pid"
 HDMI_LOG_FILE="$REMOTE_STATE_DIR/hdmi.log"
 UVC_LOG_FILE="$REMOTE_STATE_DIR/uvc.log"
+HDMI_DUMP_FILE="$REMOTE_STATE_DIR/hdmi_dump.h265"
+UVC_DUMP_FILE="$REMOTE_STATE_DIR/uvc_dump.h265"
 
-HDMI_CMD="gst-launch-1.0 -e streamboxsrc source=vfmcap output-format=p010 num-buffers=-1 ! \"video/x-raw,format=P010_10LE,width=3840,height=2160\" ! queue max-size-buffers=5 max-size-time=0 max-size-bytes=0 ! amlvenc internal-bit-depth=10 gop=60 gop-pattern=0 bitrate=30000 framerate=60 ! video/x-h265 ! h265parse config-interval=-1 ! queue max-size-buffers=30 max-size-time=0 max-size-bytes=0 ! mpegtsmux alignment=7 latency=100000000 ! srtsink uri=\"srt://:8888\" wait-for-connection=false sync=false"
-UVC_CMD="gst-launch-1.0 -e v4l2src device=/dev/video0 num-buffers=-1 ! \"video/x-h264,width=1920,height=1080,framerate=30/1\" ! h264parse ! amlv4l2h264dec ! queue max-size-buffers=5 max-size-time=0 max-size-bytes=0 ! \"video/x-raw,format=NV12\" ! amlvenc bitrate=4000 framerate=30 gop=5 gop-pattern=0 ! video/x-h265 ! h265parse config-interval=-1 ! queue max-size-buffers=30 max-size-time=0 max-size-bytes=0 ! mpegtsmux alignment=7 latency=100000000 ! srtsink uri=\"srt://:8889\" wait-for-connection=false sync=false"
+HDMI_CMD="gst-launch-1.0 -e streamboxsrc source=vfmcap output-format=p010 num-buffers=-1 ! \"video/x-raw,format=P010_10LE,width=3840,height=2160\" ! queue max-size-buffers=5 max-size-time=0 max-size-bytes=0 ! amlvenc internal-bit-depth=10 gop=60 gop-pattern=0 bitrate=30000 framerate=60 ! video/x-h265 ! h265parse config-interval=-1 ! tee name=hdmitee hdmitee. ! queue max-size-buffers=30 max-size-time=0 max-size-bytes=0 ! mpegtsmux alignment=7 latency=100000000 ! srtsink uri=\"srt://:8888\" wait-for-connection=false sync=false hdmitee. ! queue max-size-buffers=30 max-size-time=0 max-size-bytes=0 ! filesink location=\"$HDMI_DUMP_FILE\""
+UVC_CMD="gst-launch-1.0 -e v4l2src device=/dev/video0 num-buffers=-1 ! \"video/x-h264,width=1920,height=1080,framerate=30/1\" ! h264parse ! amlv4l2h264dec ! queue max-size-buffers=5 max-size-time=0 max-size-bytes=0 ! \"video/x-raw,format=NV12\" ! amlvenc bitrate=4000 framerate=30 gop=5 gop-pattern=0 ! video/x-h265 ! h265parse config-interval=-1 ! tee name=uvctee uvctee. ! queue max-size-buffers=30 max-size-time=0 max-size-bytes=0 ! mpegtsmux alignment=7 latency=100000000 ! srtsink uri=\"srt://:8889\" wait-for-connection=false sync=false uvctee. ! queue max-size-buffers=30 max-size-time=0 max-size-bytes=0 ! filesink location=\"$UVC_DUMP_FILE\""
 
 log() {
     printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
