@@ -17,18 +17,30 @@ if [ -n "$GIT_USER_EMAIL" ]; then
     git config --global user.email "$GIT_USER_EMAIL"
 fi
 
-# Configure git to use SSH for GitHub (for submodules)
+# Configure SSH for GitHub access (for Yocto git+ssh fetches)
+mkdir -p /home/builder/.ssh
+ssh-keyscan -t ed25519,rsa github.com >> /home/builder/.ssh/known_hosts 2>/dev/null || true
+
+# Method 1: SSH agent socket forwarded from host
+if [ -n "$SSH_AUTH_SOCK" ]; then
+    echo "SSH agent socket detected at $SSH_AUTH_SOCK"
+    # Make the socket accessible to the builder user
+    chmod 777 "$SSH_AUTH_SOCK" 2>/dev/null || true
+    chmod 755 "$(dirname "$SSH_AUTH_SOCK")" 2>/dev/null || true
+fi
+
+# Method 2: SSH private key passed as environment variable (fallback)
 if [ -n "$GITHUB_SSH_KEY" ]; then
-    mkdir -p /home/builder/.ssh
     echo "$GITHUB_SSH_KEY" > /home/builder/.ssh/id_rsa
     chmod 600 /home/builder/.ssh/id_rsa
-    chown -R builder:builder /home/builder/.ssh
-    cat >> /home/builder/.ssh/config << 'EOF'
+fi
+
+cat >> /home/builder/.ssh/config << 'EOF'
 Host github.com
     StrictHostKeyChecking no
 EOF
-    chmod 600 /home/builder/.ssh/config
-fi
+chmod 600 /home/builder/.ssh/config
+chown -R builder:builder /home/builder/.ssh
 
 # Set up bitbake environment variables
 export LC_ALL=en_US.UTF-8

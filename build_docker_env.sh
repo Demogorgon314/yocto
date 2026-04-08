@@ -37,6 +37,16 @@ else
   echo "Use -f flag to force rebuild."
 fi
 
+# Forward SSH agent for git+ssh fetches inside Docker
+SSH_ARGS=""
+if [ -n "$SSH_AUTH_SOCK" ]; then
+  SSH_ARGS="-v $SSH_AUTH_SOCK:/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent"
+  echo "SSH agent forwarding enabled"
+else
+  echo "WARNING: SSH_AUTH_SOCK not set — git+ssh fetches inside Docker may fail"
+  echo "  Run: eval \$(ssh-agent) && ssh-add"
+fi
+
 # Run the container as non-root user with proper UID/GID mapping
 exec docker run -it \
   --rm \
@@ -44,5 +54,6 @@ exec docker run -it \
   -w /workspace \
   -e LOCAL_UID=$(id -u) \
   -e LOCAL_GID=$(id -g) \
+  $SSH_ARGS \
   "${DOCKER_IMAGE_NAME}" \
   /bin/bash
