@@ -1,0 +1,1 @@
+cmd_/home/anshi/yocto/aml-comp/hardware/aml-5.15/amlogic/vfm_cap/vfm_cap.mod := printf '%s\n'   vfm_cap.o | awk '!x[$$0]++ { print("/home/anshi/yocto/aml-comp/hardware/aml-5.15/amlogic/vfm_cap/"$$0) }' > /home/anshi/yocto/aml-comp/hardware/aml-5.15/amlogic/vfm_cap/vfm_cap.mod

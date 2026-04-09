@@ -1,0 +1,1339 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * vfm_cap.c - VFM Capture Tee Module (Phase 1)
+ *
+ * Inserts into the VFM chain as:
+ *   vdin0 -> vfm_cap -> deinterlace -> amvideo
+ *
+ * Provides /dev/video_cap as a V4L2 capture device with:
+ *   - Zero-copy access to vdin0's CMA frame buffers
+ *   - Per-frame reference counting (display path + V4L2 consumers)
+ *   - MMAP and DMA-buf export support
+ *   - Transparent passthrough to display path
+ *
+ * Phase 1: Single V4L2 consumer, no V4L2 events.
+ *
+ * Copyright (C) 2026 StreamBox
+ */
+
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/slab.h>
+#include <linux/delay.h>
+#include <linux/ktime.h>
+#include <linux/io.h>
+#include <linux/dma-mapping.h>
+#include <linux/dma-buf.h>
+#include <linux/scatterlist.h>
+#include <linux/videodev2.h>
+#include <media/v4l2-device.h>
+#include <media/v4l2-ioctl.h>
+#include <media/v4l2-fh.h>
+#include <media/videobuf2-v4l2.h>
+#include <media/videobuf2-dma-contig.h>
+#include <linux/amlogic/media/vfm/vframe.h>
+#include <linux/amlogic/media/vfm/vframe_provider.h>
+#include <linux/amlogic/media/vfm/vframe_receiver.h>
+#include <linux/amlogic/media/codec_mm/codec_mm.h>
+
+#include "vfm_cap.h"
+
+/* ========== Module Parameters ========== */
+
+static char *provider_name = "vdin0";
+module_param(provider_name, charp, 0444);
+MODULE_PARM_DESC(provider_name, "Upstream VFM provider name (default: vdin0)");
+
+static char *receiver_name = "deinterlace";
+module_param(receiver_name, charp, 0444);
+MODULE_PARM_DESC(receiver_name, "Downstream VFM receiver name (default: deinterlace)");
+
+unsigned int vfm_cap_max_consumers = VFM_CAP_MAX_CONSUMERS;
+module_param_named(max_consumers, vfm_cap_max_consumers, uint, 0644);
+MODULE_PARM_DESC(max_consumers, "Max simultaneous V4L2 consumers (default: 4)");
+
+int vfm_cap_video_nr = -1;
+module_param_named(video_nr, vfm_cap_video_nr, int, 0444);
+MODULE_PARM_DESC(video_nr, "V4L2 video device number (-1=auto)");
+
+unsigned int vfm_cap_debug;
+module_param_named(debug, vfm_cap_debug, uint, 0644);
+MODULE_PARM_DESC(debug, "Debug level (0=off, 1=info, 2=verbose)");
+
+/* ========== Global device instance ========== */
+
+static struct vfm_cap_dev *g_vfm_cap_dev;
+
+/* ========== Frame Pool Management ========== */
+
+/**
+ * frame_pool_init() - Initialize the frame pool
+ *
+ * Sets all slots to unused.
+ */
+static void frame_pool_init(struct vfm_cap_dev *dev)
+{
+	int i;
+
+	for (i = 0; i < VFM_CAP_POOL_SIZE; i++) {
+		dev->frame_pool[i].vf = NULL;
+		dev->frame_pool[i].index = i;
+		dev->frame_pool[i].in_use = false;
+		atomic_set(&dev->frame_pool[i].refcount, 0);
+		INIT_LIST_HEAD(&dev->frame_pool[i].list);
+		INIT_LIST_HEAD(&dev->frame_pool[i].pending_node);
+	}
+}
+
+/**
+ * frame_pool_alloc() - Get a free cap_frame slot
+ *
+ * Must be called with ready_lock held.
+ * Returns NULL if pool is exhausted.
+ */
+static struct cap_frame *frame_pool_alloc(struct vfm_cap_dev *dev)
+{
+	int i;
+
+	for (i = 0; i < VFM_CAP_POOL_SIZE; i++) {
+		if (!dev->frame_pool[i].in_use) {
+			dev->frame_pool[i].in_use = true;
+			return &dev->frame_pool[i];
+		}
+	}
+	return NULL;
+}
+
+/**
+ * frame_release() - Release a cap_frame back to vdin0 when refcount hits 0
+ *
+ * Called when atomic_dec_and_test(&frame->refcount) succeeds.
+ * Puts the vframe back to upstream and marks the slot free.
+ */
+static void frame_release(struct vfm_cap_dev *dev, struct cap_frame *frame)
+{
+	if (frame->vf) {
+		vfm_cap_dbg(2, "recycling vframe idx=%u to %s\n",
+			     frame->vf->index, dev->recv_name);
+		vf_put(frame->vf, dev->recv_name);
+		vf_notify_provider(dev->recv_name,
+				   VFRAME_EVENT_RECEIVER_PUT, NULL);
+		frame->vf = NULL;
+	}
+	frame->in_use = false;
+}
+
+/**
+ * frame_put() - Decrement refcount; release if zero
+ *
+ * Safe to call from any context. Uses the ready_lock to protect pool state.
+ */
+static void frame_put(struct vfm_cap_dev *dev, struct cap_frame *frame)
+{
+	unsigned long flags;
+
+	if (atomic_dec_and_test(&frame->refcount)) {
+		spin_lock_irqsave(&dev->ready_lock, flags);
+		list_del_init(&frame->list);
+		frame_release(dev, frame);
+		spin_unlock_irqrestore(&dev->ready_lock, flags);
+	}
+}
+
+/* ========== Format Detection from vframe ========== */
+
+/**
+ * vfm_cap_update_format() - Detect format from incoming vframe
+ *
+ * Called when we get a new frame. Updates the device format state
+ * so V4L2 consumers can query it.
+ */
+static void vfm_cap_update_format(struct vfm_cap_dev *dev,
+				   struct vframe_s *vf)
+{
+	u32 w, h, pixfmt;
+	u32 bpl, size;
+	unsigned long flags;
+
+	if (!vf)
+		return;
+
+	w = vf->width;
+	h = vf->height;
+
+	/*
+	 * Detect pixel format from vframe type flags.
+	 * vdin0 outputs NV21 (Y/CrCb) by default for 8-bit,
+	 * or P010-like for 10-bit.
+	 */
+	if (vf->type & VIDTYPE_VIU_NV21)
+		pixfmt = V4L2_PIX_FMT_NV21;
+	else if (vf->type & VIDTYPE_VIU_NV12)
+		pixfmt = V4L2_PIX_FMT_NV12;
+	else if (vf->type & VIDTYPE_VIU_422)
+		pixfmt = V4L2_PIX_FMT_UYVY;
+	else
+		pixfmt = V4L2_PIX_FMT_NV21; /* default assumption */
+
+	spin_lock_irqsave(&dev->fmt_spin, flags);
+	if (dev->fmt_valid && dev->width == w && dev->height == h &&
+	    dev->pixelformat == pixfmt) {
+		spin_unlock_irqrestore(&dev->fmt_spin, flags);
+		return; /* no change */
+	}
+
+	dev->width = w;
+	dev->height = h;
+	dev->pixelformat = pixfmt;
+
+	switch (pixfmt) {
+	case V4L2_PIX_FMT_NV21:
+	case V4L2_PIX_FMT_NV12:
+		/* Semi-planar YUV420: Y plane + interleaved UV plane */
+		dev->num_planes = 1; /* single-buffer for Phase 1 */
+		bpl = w;
+		size = w * h * 3 / 2;
+		dev->bytesperline[0] = bpl;
+		dev->sizeimage[0] = PAGE_ALIGN(size);
+		break;
+	case V4L2_PIX_FMT_UYVY:
+		dev->num_planes = 1;
+		bpl = w * 2;
+		size = bpl * h;
+		dev->bytesperline[0] = bpl;
+		dev->sizeimage[0] = PAGE_ALIGN(size);
+		break;
+	default:
+		dev->num_planes = 1;
+		bpl = w;
+		size = w * h * 3 / 2;
+		dev->bytesperline[0] = bpl;
+		dev->sizeimage[0] = PAGE_ALIGN(size);
+		break;
+	}
+
+	dev->colorspace = V4L2_COLORSPACE_DEFAULT;
+	dev->field = (vf->type & VIDTYPE_INTERLACE) ?
+		     V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
+	dev->fmt_valid = true;
+
+	spin_unlock_irqrestore(&dev->fmt_spin, flags);
+
+	vfm_cap_info("format updated: %ux%u pixfmt=0x%x size=%u\n",
+		     w, h, pixfmt, dev->sizeimage[0]);
+}
+
+/* ========== V4L2 Consumer Frame Delivery (Workqueue) ========== */
+
+/**
+ * vfm_cap_deliver_work() - Deliver pending frames to V4L2 consumers
+ *
+ * Runs in workqueue context (process context, can sleep/memcpy safely).
+ * Drains the pending_list and copies frame data into V4L2 buffers.
+ *
+ * Each frame on pending_list holds a V4L2 reference (refcount includes +1
+ * for this pending work). After copy, we decrement that reference.
+ */
+static void vfm_cap_deliver_work(struct work_struct *work)
+{
+	struct vfm_cap_dev *dev = container_of(work, struct vfm_cap_dev,
+					       deliver_work);
+	struct cap_frame *frame, *tmp;
+	struct vfm_cap_consumer *cons;
+	struct vfm_cap_buffer *buf;
+	struct vb2_v4l2_buffer *vb;
+	unsigned long flags;
+	LIST_HEAD(local_pending);
+	int delivered;
+
+	/*
+	 * Move all pending frames to a local list under the spinlock
+	 * so we minimize time holding the lock.
+	 */
+	spin_lock_irqsave(&dev->ready_lock, flags);
+	list_splice_init(&dev->pending_list, &local_pending);
+	spin_unlock_irqrestore(&dev->ready_lock, flags);
+
+	list_for_each_entry_safe(frame, tmp, &local_pending, pending_node) {
+		list_del_init(&frame->pending_node);
+		delivered = 0;
+
+		if (!frame->vf || !frame->vf->canvas0_config[0].phy_addr) {
+			frame_put(dev, frame);
+			continue;
+		}
+
+		/*
+		 * Deliver to each streaming consumer that has a queued buffer.
+		 * consumer_lock mutex is safe here (workqueue = process ctx).
+		 */
+		mutex_lock(&dev->consumer_lock);
+		list_for_each_entry(cons, &dev->consumers, list) {
+			void *src, *dst;
+			u32 copy_size;
+
+			if (!cons->streaming)
+				continue;
+
+			spin_lock_irqsave(&cons->queue_lock, flags);
+			if (list_empty(&cons->queued_list)) {
+				spin_unlock_irqrestore(&cons->queue_lock, flags);
+				continue;
+			}
+
+			buf = list_first_entry(&cons->queued_list,
+					       struct vfm_cap_buffer, list);
+			list_del_init(&buf->list);
+			spin_unlock_irqrestore(&cons->queue_lock, flags);
+
+			buf->frame = frame;
+			vb = &buf->vb;
+
+			/*
+			 * Copy frame data from vdin0 CMA buffer into
+			 * vb2 MMAP buffer. CMA memory is in the kernel's
+			 * linear map on ARM64, so phys_to_virt() works.
+			 */
+			copy_size = dev->sizeimage[0];
+			if (copy_size > vb2_plane_size(&vb->vb2_buf, 0))
+				copy_size = vb2_plane_size(&vb->vb2_buf, 0);
+
+			src = phys_to_virt(
+				frame->vf->canvas0_config[0].phy_addr);
+			dst = vb2_plane_vaddr(&vb->vb2_buf, 0);
+			if (src && dst) {
+				memcpy(dst, src, copy_size);
+				vb2_set_plane_payload(&vb->vb2_buf, 0,
+						      copy_size);
+			} else {
+				vfm_cap_err("copy failed: src=%p dst=%p\n",
+					    src, dst);
+				vb2_set_plane_payload(&vb->vb2_buf, 0, 0);
+			}
+
+			vb->vb2_buf.timestamp = ktime_get_ns();
+			vb->sequence = cons->frame_count++;
+			vb->field = dev->field;
+
+			vb2_buffer_done(&vb->vb2_buf, VB2_BUF_STATE_DONE);
+			delivered++;
+		}
+		mutex_unlock(&dev->consumer_lock);
+
+		if (delivered > 0)
+			atomic64_inc(&dev->stat_delivered);
+
+		/* Release the V4L2 copy reference on this frame */
+		frame_put(dev, frame);
+	}
+}
+
+/* ========== VFM Provider Ops (downstream interface) ========== */
+/*
+ * These ops are called by the downstream receiver (deinterlace)
+ * to get frames from us.
+ */
+
+static struct vframe_s *vfm_cap_vf_peek(void *op_arg)
+{
+	struct vfm_cap_dev *dev = (struct vfm_cap_dev *)op_arg;
+	struct cap_frame *frame;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->ready_lock, flags);
+	if (list_empty(&dev->ready_list)) {
+		spin_unlock_irqrestore(&dev->ready_lock, flags);
+		return NULL;
+	}
+	frame = list_first_entry(&dev->ready_list, struct cap_frame, list);
+	spin_unlock_irqrestore(&dev->ready_lock, flags);
+
+	return frame->vf;
+}
+
+static struct vframe_s *vfm_cap_vf_get(void *op_arg)
+{
+	struct vfm_cap_dev *dev = (struct vfm_cap_dev *)op_arg;
+	struct cap_frame *frame;
+	struct vframe_s *vf;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->ready_lock, flags);
+	if (list_empty(&dev->ready_list)) {
+		spin_unlock_irqrestore(&dev->ready_lock, flags);
+		return NULL;
+	}
+	frame = list_first_entry(&dev->ready_list, struct cap_frame, list);
+	list_del_init(&frame->list);
+	spin_unlock_irqrestore(&dev->ready_lock, flags);
+
+	vf = frame->vf;
+
+	vfm_cap_dbg(2, "downstream get vf idx=%u, refcount=%d\n",
+		     vf ? vf->index : 0xFFFF,
+		     atomic_read(&frame->refcount));
+
+	return vf;
+}
+
+/**
+ * vfm_cap_vf_put() - Downstream (deinterlace) returns a frame
+ *
+ * This decrements the display path's reference. If no V4L2 consumers
+ * held the frame (or they already released), this recycles the buffer
+ * back to vdin0.
+ */
+static void vfm_cap_vf_put(struct vframe_s *vf, void *op_arg)
+{
+	struct vfm_cap_dev *dev = (struct vfm_cap_dev *)op_arg;
+	struct cap_frame *frame;
+	int i;
+
+	if (!vf)
+		return;
+
+	/* Find the cap_frame for this vframe */
+	for (i = 0; i < VFM_CAP_POOL_SIZE; i++) {
+		if (dev->frame_pool[i].in_use &&
+		    dev->frame_pool[i].vf == vf) {
+			frame = &dev->frame_pool[i];
+			vfm_cap_dbg(2, "downstream put vf idx=%u\n",
+				     vf->index);
+			frame_put(dev, frame);
+			return;
+		}
+	}
+
+	/*
+	 * Frame not found in our pool - this shouldn't happen normally.
+	 * Pass it directly back to upstream as a safety measure.
+	 */
+	vfm_cap_err("put: unknown vframe idx=%u, passing through\n",
+		    vf->index);
+	vf_put(vf, dev->recv_name);
+	vf_notify_provider(dev->recv_name, VFRAME_EVENT_RECEIVER_PUT, NULL);
+}
+
+static int vfm_cap_prov_event_cb(int type, void *data, void *private_data)
+{
+	struct vfm_cap_dev *dev = (struct vfm_cap_dev *)private_data;
+
+	if (type & VFRAME_EVENT_RECEIVER_PUT) {
+		vfm_cap_dbg(2, "prov_event: RECEIVER_PUT\n");
+	} else if (type & VFRAME_EVENT_RECEIVER_GET) {
+		vfm_cap_dbg(2, "prov_event: RECEIVER_GET\n");
+	} else if (type & VFRAME_EVENT_RECEIVER_FRAME_WAIT) {
+		vfm_cap_dbg(2, "prov_event: RECEIVER_FRAME_WAIT\n");
+		/* Downstream is hungry - check if we have frames */
+		if (!list_empty(&dev->ready_list))
+			vf_notify_receiver(dev->prov_name,
+					   VFRAME_EVENT_PROVIDER_VFRAME_READY,
+					   NULL);
+	}
+	return 0;
+}
+
+static int vfm_cap_vf_states(struct vframe_states *states, void *op_arg)
+{
+	struct vfm_cap_dev *dev = (struct vfm_cap_dev *)op_arg;
+	int ready_count = 0;
+	struct cap_frame *f;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->ready_lock, flags);
+	list_for_each_entry(f, &dev->ready_list, list)
+		ready_count++;
+	spin_unlock_irqrestore(&dev->ready_lock, flags);
+
+	states->vf_pool_size = VFM_CAP_POOL_SIZE;
+	states->buf_recycle_num = 0;
+	states->buf_free_num = VFM_CAP_POOL_SIZE - ready_count;
+	states->buf_avail_num = ready_count;
+	return 0;
+}
+
+static const struct vframe_operations_s vfm_cap_vf_provider_ops = {
+	.peek     = vfm_cap_vf_peek,
+	.get      = vfm_cap_vf_get,
+	.put      = vfm_cap_vf_put,
+	.event_cb = vfm_cap_prov_event_cb,
+	.vf_states = vfm_cap_vf_states,
+};
+
+/* ========== VFM Receiver Event Callback (upstream interface) ========== */
+/*
+ * Called by the upstream provider (vdin0) to notify us of events.
+ * This runs in ISR context when VFRAME_READY fires.
+ */
+
+static int vfm_cap_recv_event_cb(int type, void *data, void *private_data)
+{
+	struct vfm_cap_dev *dev = (struct vfm_cap_dev *)private_data;
+	struct vframe_s *vf;
+	struct cap_frame *frame;
+	unsigned long flags;
+	int num_streaming = 0;
+	struct vfm_cap_consumer *cons;
+
+	if (type == VFRAME_EVENT_PROVIDER_START) {
+		/*
+		 * Upstream says "start streaming". Register our provider
+		 * to connect to downstream (deinterlace).
+		 * This follows the amlvideo.c pattern exactly.
+		 */
+		vfm_cap_info("PROVIDER_START: registering provider '%s'\n",
+			     dev->prov_name);
+
+		spin_lock_irqsave(&dev->ready_lock, flags);
+		frame_pool_init(dev);
+		INIT_LIST_HEAD(&dev->ready_list);
+		INIT_LIST_HEAD(&dev->pending_list);
+		spin_unlock_irqrestore(&dev->ready_lock, flags);
+
+		if (vf_get_receiver(dev->prov_name)) {
+			vf_provider_init(&dev->vf_prov, dev->prov_name,
+					 &vfm_cap_vf_provider_ops, dev);
+			vf_reg_provider(&dev->vf_prov);
+			vf_notify_receiver(dev->prov_name,
+					   VFRAME_EVENT_PROVIDER_START, NULL);
+		}
+		dev->vfm_started = true;
+
+	} else if (type == VFRAME_EVENT_PROVIDER_UNREG) {
+		/*
+		 * Upstream is going away. Unregister our provider.
+		 */
+		vfm_cap_info("PROVIDER_UNREG: unregistering provider\n");
+
+		if (vf_get_receiver(dev->prov_name))
+			vf_unreg_provider(&dev->vf_prov);
+
+		/* Cancel any pending V4L2 delivery work */
+		cancel_work_sync(&dev->deliver_work);
+
+		/* Flush the frame pool - release any held frames */
+		spin_lock_irqsave(&dev->ready_lock, flags);
+		frame_pool_init(dev);
+		INIT_LIST_HEAD(&dev->ready_list);
+		INIT_LIST_HEAD(&dev->pending_list);
+		spin_unlock_irqrestore(&dev->ready_lock, flags);
+
+		dev->vfm_started = false;
+
+	} else if (type == VFRAME_EVENT_PROVIDER_REG) {
+		vfm_cap_info("PROVIDER_REG\n");
+		dev->vfm_started = false;
+
+	} else if (type == VFRAME_EVENT_PROVIDER_QUREY_STATE) {
+		struct vframe_states states;
+
+		vfm_cap_vf_states(&states, dev);
+		if (states.buf_avail_num > 0)
+			return RECEIVER_ACTIVE;
+		/* Also check downstream */
+		if (vf_notify_receiver(dev->prov_name,
+				       VFRAME_EVENT_PROVIDER_QUREY_STATE,
+				       NULL) == RECEIVER_ACTIVE)
+			return RECEIVER_ACTIVE;
+		return RECEIVER_INACTIVE;
+
+	} else if (type == VFRAME_EVENT_PROVIDER_VFRAME_READY) {
+		/*
+		 * A new frame is available from upstream (vdin0).
+		 * This is the hot path - called from vdin0 ISR context
+		 * (hard IRQ, irqs disabled by isr_lock).
+		 *
+		 * We do only lock-safe operations here:
+		 * 1. Get the vframe from upstream (vf_get is IRQ-safe)
+		 * 2. Update format state (spinlock-protected)
+		 * 3. Wrap in cap_frame, add to ready_list (for downstream)
+		 * 4. Optionally add to pending_list (for V4L2 workqueue)
+		 * 5. Notify downstream
+		 * 6. Schedule workqueue for V4L2 delivery (memcpy)
+		 */
+		vf = vf_peek(dev->recv_name);
+		if (!vf)
+			return 0;
+
+		vf = vf_get(dev->recv_name);
+		if (!vf)
+			return 0;
+
+		atomic64_inc(&dev->stat_frames);
+
+		/* Update format on first frame or format change */
+		vfm_cap_update_format(dev, vf);
+
+		/*
+		 * Check if any consumers are streaming to determine
+		 * whether we need V4L2 delivery.
+		 */
+		spin_lock(&dev->consumer_spin);
+		list_for_each_entry(cons, &dev->consumers, list) {
+			if (cons->streaming)
+				num_streaming++;
+		}
+		spin_unlock(&dev->consumer_spin);
+
+		/* Allocate a cap_frame wrapper */
+		spin_lock_irqsave(&dev->ready_lock, flags);
+		frame = frame_pool_alloc(dev);
+		if (!frame) {
+			spin_unlock_irqrestore(&dev->ready_lock, flags);
+			vfm_cap_dbg(1, "pool exhausted, dropping frame\n");
+			/* Recycle frame back to vdin0 */
+			vf_put(vf, dev->recv_name);
+			vf_notify_provider(dev->recv_name,
+					   VFRAME_EVENT_RECEIVER_PUT, NULL);
+			atomic64_inc(&dev->stat_drops);
+			return 0;
+		}
+
+		frame->vf = vf;
+		frame->acquired_at = ktime_get();
+		INIT_LIST_HEAD(&frame->list);
+		INIT_LIST_HEAD(&frame->pending_node);
+
+		/*
+		 * Set refcount:
+		 *   1 = display path (downstream will get/put)
+		 *  +1 = V4L2 copy work (if consumers streaming)
+		 */
+		if (num_streaming > 0)
+			atomic_set(&frame->refcount, 2);
+		else
+			atomic_set(&frame->refcount, 1);
+
+		/* Add to ready list for downstream to pick up */
+		list_add_tail(&frame->list, &dev->ready_list);
+
+		/* Add to pending list for V4L2 delivery if needed */
+		if (num_streaming > 0)
+			list_add_tail(&frame->pending_node,
+				      &dev->pending_list);
+
+		spin_unlock_irqrestore(&dev->ready_lock, flags);
+
+		/* Notify downstream that a frame is ready */
+		vf_notify_receiver(dev->prov_name,
+				   VFRAME_EVENT_PROVIDER_VFRAME_READY, NULL);
+
+		/* Schedule V4L2 delivery work (memcpy in process context) */
+		if (num_streaming > 0)
+			schedule_work(&dev->deliver_work);
+
+		/* Wake up any polling consumers */
+		wake_up_interruptible(&dev->wq);
+
+	} else if (type == VFRAME_EVENT_PROVIDER_RESET) {
+		vfm_cap_info("PROVIDER_RESET\n");
+
+		spin_lock_irqsave(&dev->ready_lock, flags);
+		frame_pool_init(dev);
+		INIT_LIST_HEAD(&dev->ready_list);
+		INIT_LIST_HEAD(&dev->pending_list);
+		spin_unlock_irqrestore(&dev->ready_lock, flags);
+
+		/* Forward reset downstream */
+		vf_notify_receiver(dev->prov_name,
+				   VFRAME_EVENT_PROVIDER_RESET, data);
+
+	} else if (type == VFRAME_EVENT_PROVIDER_FR_HINT) {
+		/* Pass through frame rate hint */
+		vf_notify_receiver(dev->prov_name,
+				   VFRAME_EVENT_PROVIDER_FR_HINT, data);
+	} else if (type == VFRAME_EVENT_PROVIDER_FR_END_HINT) {
+		vf_notify_receiver(dev->prov_name,
+				   VFRAME_EVENT_PROVIDER_FR_END_HINT, data);
+	}
+
+	return 0;
+}
+
+static const struct vframe_receiver_op_s vfm_cap_vf_receiver_ops = {
+	.event_cb = vfm_cap_recv_event_cb,
+};
+
+/* ========== vb2 Queue Operations ========== */
+
+static int vfm_cap_queue_setup(struct vb2_queue *vq,
+			       unsigned int *num_buffers,
+			       unsigned int *num_planes,
+			       unsigned int sizes[],
+			       struct device *alloc_devs[])
+{
+	struct vfm_cap_consumer *cons = vb2_get_drv_priv(vq);
+	struct vfm_cap_dev *dev = cons->dev;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->fmt_spin, flags);
+	if (!dev->fmt_valid) {
+		/*
+		 * No frames received yet. Use a reasonable default.
+		 * Consumer will need to call S_FMT or wait for frames.
+		 */
+		spin_unlock_irqrestore(&dev->fmt_spin, flags);
+		*num_planes = 1;
+		sizes[0] = PAGE_ALIGN(1920 * 1080 * 3 / 2); /* 1080p NV21 */
+		alloc_devs[0] = v4l_get_dev_from_codec_mm();
+		return 0;
+	}
+
+	*num_planes = dev->num_planes;
+	sizes[0] = dev->sizeimage[0];
+	spin_unlock_irqrestore(&dev->fmt_spin, flags);
+	alloc_devs[0] = v4l_get_dev_from_codec_mm();
+
+	vfm_cap_dbg(1, "queue_setup: %u buffers, %u planes, size=%u\n",
+		    *num_buffers, *num_planes, sizes[0]);
+	return 0;
+}
+
+static int vfm_cap_buf_init(struct vb2_buffer *vb)
+{
+	return 0;
+}
+
+static int vfm_cap_buf_prepare(struct vb2_buffer *vb)
+{
+	struct vfm_cap_consumer *cons = vb2_get_drv_priv(vb->vb2_queue);
+	struct vfm_cap_dev *dev = cons->dev;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->fmt_spin, flags);
+	if (dev->fmt_valid && dev->num_planes >= 1) {
+		if (vb2_plane_size(vb, 0) < dev->sizeimage[0]) {
+			vfm_cap_err("buf_prepare: plane too small (%lu < %u)\n",
+				    vb2_plane_size(vb, 0), dev->sizeimage[0]);
+			spin_unlock_irqrestore(&dev->fmt_spin, flags);
+			return -EINVAL;
+		}
+	}
+	spin_unlock_irqrestore(&dev->fmt_spin, flags);
+	return 0;
+}
+
+static void vfm_cap_buf_queue(struct vb2_buffer *vb)
+{
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct vfm_cap_buffer *buf = to_vfm_cap_buffer(vbuf);
+	struct vfm_cap_consumer *cons = vb2_get_drv_priv(vb->vb2_queue);
+	unsigned long flags;
+
+	spin_lock_irqsave(&cons->queue_lock, flags);
+	list_add_tail(&buf->list, &cons->queued_list);
+	spin_unlock_irqrestore(&cons->queue_lock, flags);
+}
+
+static int vfm_cap_start_streaming(struct vb2_queue *vq, unsigned int count)
+{
+	struct vfm_cap_consumer *cons = vb2_get_drv_priv(vq);
+
+	vfm_cap_info("consumer %u start streaming (bufs=%u)\n",
+		     cons->id, count);
+	cons->streaming = true;
+	cons->frame_count = 0;
+	return 0;
+}
+
+static void vfm_cap_stop_streaming(struct vb2_queue *vq)
+{
+	struct vfm_cap_consumer *cons = vb2_get_drv_priv(vq);
+	struct vfm_cap_buffer *buf, *tmp;
+	unsigned long flags;
+
+	vfm_cap_info("consumer %u stop streaming\n", cons->id);
+	cons->streaming = false;
+
+	/* Return all queued buffers to userspace with ERROR state */
+	spin_lock_irqsave(&cons->queue_lock, flags);
+	list_for_each_entry_safe(buf, tmp, &cons->queued_list, list) {
+		list_del_init(&buf->list);
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+	}
+	spin_unlock_irqrestore(&cons->queue_lock, flags);
+}
+
+static void vfm_cap_buf_finish(struct vb2_buffer *vb)
+{
+	/* No-op for Phase 1 (copy mode) */
+}
+
+static const struct vb2_ops vfm_cap_vb2_ops = {
+	.queue_setup     = vfm_cap_queue_setup,
+	.buf_init        = vfm_cap_buf_init,
+	.buf_prepare     = vfm_cap_buf_prepare,
+	.buf_queue       = vfm_cap_buf_queue,
+	.buf_finish      = vfm_cap_buf_finish,
+	.start_streaming = vfm_cap_start_streaming,
+	.stop_streaming  = vfm_cap_stop_streaming,
+	.wait_prepare    = vb2_ops_wait_prepare,
+	.wait_finish     = vb2_ops_wait_finish,
+};
+
+/* ========== V4L2 ioctl Operations ========== */
+
+static int vfm_cap_querycap(struct file *file, void *fh,
+			    struct v4l2_capability *cap)
+{
+	strscpy(cap->driver, VFM_CAP_MODULE_NAME, sizeof(cap->driver));
+	strscpy(cap->card, "VFM Capture Tee", sizeof(cap->card));
+	strscpy(cap->bus_info, "platform:vfm_cap", sizeof(cap->bus_info));
+	return 0;
+}
+
+static int vfm_cap_enum_fmt(struct file *file, void *fh,
+			    struct v4l2_fmtdesc *f)
+{
+	/* We support NV21, NV12, UYVY */
+	static const u32 formats[] = {
+		V4L2_PIX_FMT_NV21,
+		V4L2_PIX_FMT_NV12,
+		V4L2_PIX_FMT_UYVY,
+	};
+
+	if (f->index >= ARRAY_SIZE(formats))
+		return -EINVAL;
+
+	f->pixelformat = formats[f->index];
+	return 0;
+}
+
+static int vfm_cap_g_fmt(struct file *file, void *fh,
+			 struct v4l2_format *f)
+{
+	struct vfm_cap_consumer *cons = file->private_data;
+	struct vfm_cap_dev *dev = cons->dev;
+	struct v4l2_pix_format_mplane *mp = &f->fmt.pix_mp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->fmt_spin, flags);
+	if (!dev->fmt_valid) {
+		/* Return a sane default */
+		mp->width = 1920;
+		mp->height = 1080;
+		mp->pixelformat = V4L2_PIX_FMT_NV21;
+		mp->num_planes = 1;
+		mp->plane_fmt[0].bytesperline = 1920;
+		mp->plane_fmt[0].sizeimage = PAGE_ALIGN(1920 * 1080 * 3 / 2);
+		mp->field = V4L2_FIELD_NONE;
+		mp->colorspace = V4L2_COLORSPACE_DEFAULT;
+	} else {
+		mp->width = dev->width;
+		mp->height = dev->height;
+		mp->pixelformat = dev->pixelformat;
+		mp->num_planes = dev->num_planes;
+		mp->plane_fmt[0].bytesperline = dev->bytesperline[0];
+		mp->plane_fmt[0].sizeimage = dev->sizeimage[0];
+		mp->field = dev->field;
+		mp->colorspace = dev->colorspace;
+	}
+	spin_unlock_irqrestore(&dev->fmt_spin, flags);
+
+	return 0;
+}
+
+static int vfm_cap_s_fmt(struct file *file, void *fh,
+			 struct v4l2_format *f)
+{
+	/*
+	 * Phase 1: Format is determined by upstream vdin0 signal.
+	 * S_FMT is a no-op that returns the current format.
+	 * The consumer should use G_FMT to discover the format.
+	 */
+	return vfm_cap_g_fmt(file, fh, f);
+}
+
+static int vfm_cap_try_fmt(struct file *file, void *fh,
+			   struct v4l2_format *f)
+{
+	return vfm_cap_g_fmt(file, fh, f);
+}
+
+static int vfm_cap_reqbufs(struct file *file, void *fh,
+			   struct v4l2_requestbuffers *rb)
+{
+	return vb2_ioctl_reqbufs(file, fh, rb);
+}
+
+static int vfm_cap_querybuf(struct file *file, void *fh,
+			    struct v4l2_buffer *b)
+{
+	return vb2_ioctl_querybuf(file, fh, b);
+}
+
+static int vfm_cap_qbuf(struct file *file, void *fh,
+			struct v4l2_buffer *b)
+{
+	return vb2_ioctl_qbuf(file, fh, b);
+}
+
+static int vfm_cap_dqbuf(struct file *file, void *fh,
+			 struct v4l2_buffer *b)
+{
+	return vb2_ioctl_dqbuf(file, fh, b);
+}
+
+static int vfm_cap_expbuf(struct file *file, void *fh,
+			  struct v4l2_exportbuffer *eb)
+{
+	return vb2_ioctl_expbuf(file, fh, eb);
+}
+
+static int vfm_cap_streamon(struct file *file, void *fh,
+			    enum v4l2_buf_type type)
+{
+	return vb2_ioctl_streamon(file, fh, type);
+}
+
+static int vfm_cap_streamoff(struct file *file, void *fh,
+			     enum v4l2_buf_type type)
+{
+	return vb2_ioctl_streamoff(file, fh, type);
+}
+
+static int vfm_cap_enum_input(struct file *file, void *fh,
+			      struct v4l2_input *inp)
+{
+	if (inp->index > 0)
+		return -EINVAL;
+
+	strscpy(inp->name, "VFM Capture", sizeof(inp->name));
+	inp->type = V4L2_INPUT_TYPE_CAMERA;
+	return 0;
+}
+
+static int vfm_cap_g_input(struct file *file, void *fh, unsigned int *i)
+{
+	*i = 0;
+	return 0;
+}
+
+static int vfm_cap_s_input(struct file *file, void *fh, unsigned int i)
+{
+	return (i == 0) ? 0 : -EINVAL;
+}
+
+static const struct v4l2_ioctl_ops vfm_cap_ioctl_ops = {
+	.vidioc_querycap              = vfm_cap_querycap,
+	.vidioc_enum_fmt_vid_cap      = vfm_cap_enum_fmt,
+	.vidioc_g_fmt_vid_cap_mplane  = vfm_cap_g_fmt,
+	.vidioc_s_fmt_vid_cap_mplane  = vfm_cap_s_fmt,
+	.vidioc_try_fmt_vid_cap_mplane = vfm_cap_try_fmt,
+	.vidioc_reqbufs               = vfm_cap_reqbufs,
+	.vidioc_querybuf              = vfm_cap_querybuf,
+	.vidioc_qbuf                  = vfm_cap_qbuf,
+	.vidioc_dqbuf                 = vfm_cap_dqbuf,
+	.vidioc_expbuf                = vfm_cap_expbuf,
+	.vidioc_streamon              = vfm_cap_streamon,
+	.vidioc_streamoff             = vfm_cap_streamoff,
+	.vidioc_enum_input            = vfm_cap_enum_input,
+	.vidioc_g_input               = vfm_cap_g_input,
+	.vidioc_s_input               = vfm_cap_s_input,
+};
+
+/* ========== V4L2 File Operations ========== */
+
+static int vfm_cap_open(struct file *file)
+{
+	struct vfm_cap_dev *dev = video_drvdata(file);
+	struct vfm_cap_consumer *cons;
+	struct vb2_queue *vq;
+	unsigned long flags;
+	int ret;
+
+	mutex_lock(&dev->consumer_lock);
+	if (dev->num_consumers >= vfm_cap_max_consumers) {
+		mutex_unlock(&dev->consumer_lock);
+		vfm_cap_err("max consumers (%u) reached\n",
+			    vfm_cap_max_consumers);
+		return -EBUSY;
+	}
+	mutex_unlock(&dev->consumer_lock);
+
+	cons = kzalloc(sizeof(*cons), GFP_KERNEL);
+	if (!cons)
+		return -ENOMEM;
+
+	cons->dev = dev;
+	cons->streaming = false;
+	INIT_LIST_HEAD(&cons->queued_list);
+	INIT_LIST_HEAD(&cons->list);
+	mutex_init(&cons->lock);
+	spin_lock_init(&cons->queue_lock);
+
+	/* Initialize V4L2 file handle */
+	v4l2_fh_init(&cons->fh, &dev->vdev);
+	file->private_data = cons;
+
+	/* Set up vb2 queue for this consumer */
+	vq = &cons->vb2q;
+	vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	vq->io_modes = VB2_MMAP | VB2_DMABUF;
+	vq->drv_priv = cons;
+	vq->buf_struct_size = sizeof(struct vfm_cap_buffer);
+	vq->ops = &vfm_cap_vb2_ops;
+	vq->mem_ops = &vb2_dma_contig_memops;
+	vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	vq->min_buffers_needed = 2;
+	vq->lock = &cons->lock;
+	vq->gfp_flags = GFP_DMA32;
+	vq->dev = v4l_get_dev_from_codec_mm();
+
+	ret = vb2_queue_init(vq);
+	if (ret) {
+		vfm_cap_err("vb2_queue_init failed: %d\n", ret);
+		v4l2_fh_exit(&cons->fh);
+		kfree(cons);
+		return ret;
+	}
+
+	v4l2_fh_add(&cons->fh);
+
+	mutex_lock(&dev->consumer_lock);
+	spin_lock_irqsave(&dev->consumer_spin, flags);
+	cons->id = dev->consumer_id_gen++;
+	list_add_tail(&cons->list, &dev->consumers);
+	dev->num_consumers++;
+	spin_unlock_irqrestore(&dev->consumer_spin, flags);
+	mutex_unlock(&dev->consumer_lock);
+
+	vfm_cap_info("consumer %u opened (total: %u)\n",
+		     cons->id, dev->num_consumers);
+	return 0;
+}
+
+static int vfm_cap_release(struct file *file)
+{
+	struct vfm_cap_consumer *cons = file->private_data;
+	struct vfm_cap_dev *dev = cons->dev;
+	struct vfm_cap_buffer *buf, *tmp;
+	unsigned long flags;
+
+	vfm_cap_info("consumer %u closing\n", cons->id);
+
+	/* Stop streaming if active */
+	if (cons->streaming) {
+		vb2_streamoff(&cons->vb2q,
+			      V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+		cons->streaming = false;
+	}
+
+	/* Return any remaining queued buffers */
+	spin_lock_irqsave(&cons->queue_lock, flags);
+	list_for_each_entry_safe(buf, tmp, &cons->queued_list, list) {
+		list_del_init(&buf->list);
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+	}
+	spin_unlock_irqrestore(&cons->queue_lock, flags);
+
+	/* Cleanup vb2 queue */
+	vb2_queue_release(&cons->vb2q);
+
+	/* Remove from consumer list */
+	mutex_lock(&dev->consumer_lock);
+	spin_lock_irqsave(&dev->consumer_spin, flags);
+	list_del(&cons->list);
+	dev->num_consumers--;
+	spin_unlock_irqrestore(&dev->consumer_spin, flags);
+	mutex_unlock(&dev->consumer_lock);
+
+	v4l2_fh_del(&cons->fh);
+	v4l2_fh_exit(&cons->fh);
+
+	vfm_cap_info("consumer %u closed (remaining: %u)\n",
+		     cons->id, dev->num_consumers);
+	kfree(cons);
+	return 0;
+}
+
+static __poll_t vfm_cap_poll(struct file *file,
+			     struct poll_table_struct *wait)
+{
+	struct vfm_cap_consumer *cons = file->private_data;
+
+	return vb2_poll(&cons->vb2q, file, wait);
+}
+
+static int vfm_cap_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct vfm_cap_consumer *cons = file->private_data;
+
+	return vb2_mmap(&cons->vb2q, vma);
+}
+
+static const struct v4l2_file_operations vfm_cap_fops = {
+	.owner          = THIS_MODULE,
+	.open           = vfm_cap_open,
+	.release        = vfm_cap_release,
+	.poll           = vfm_cap_poll,
+	.unlocked_ioctl = video_ioctl2,
+	.mmap           = vfm_cap_mmap,
+};
+
+/* ========== Sysfs Attributes ========== */
+
+static ssize_t status_show(struct device *device,
+			   struct device_attribute *attr, char *buf)
+{
+	struct vfm_cap_dev *dev = g_vfm_cap_dev;
+
+	if (!dev)
+		return scnprintf(buf, PAGE_SIZE, "not initialized\n");
+
+	return scnprintf(buf, PAGE_SIZE,
+			 "vfm_started: %d\n"
+			 "consumers: %u\n"
+			 "fmt_valid: %d\n",
+			 dev->vfm_started,
+			 dev->num_consumers,
+			 dev->fmt_valid);
+}
+static DEVICE_ATTR_RO(status);
+
+static ssize_t signal_info_show(struct device *device,
+				struct device_attribute *attr, char *buf)
+{
+	struct vfm_cap_dev *dev = g_vfm_cap_dev;
+	unsigned long flags;
+	int ret;
+
+	if (!dev || !dev->fmt_valid)
+		return scnprintf(buf, PAGE_SIZE, "no signal\n");
+
+	spin_lock_irqsave(&dev->fmt_spin, flags);
+	ret = scnprintf(buf, PAGE_SIZE,
+			"width: %u\n"
+			"height: %u\n"
+			"pixelformat: 0x%08x\n"
+			"sizeimage: %u\n"
+			"field: %u\n",
+			dev->width, dev->height,
+			dev->pixelformat,
+			dev->sizeimage[0],
+			dev->field);
+	spin_unlock_irqrestore(&dev->fmt_spin, flags);
+	return ret;
+}
+static DEVICE_ATTR_RO(signal_info);
+
+static ssize_t stats_show(struct device *device,
+			  struct device_attribute *attr, char *buf)
+{
+	struct vfm_cap_dev *dev = g_vfm_cap_dev;
+
+	if (!dev)
+		return scnprintf(buf, PAGE_SIZE, "not initialized\n");
+
+	return scnprintf(buf, PAGE_SIZE,
+			 "frames_received: %lld\n"
+			 "frames_dropped: %lld\n"
+			 "frames_delivered: %lld\n",
+			 atomic64_read(&dev->stat_frames),
+			 atomic64_read(&dev->stat_drops),
+			 atomic64_read(&dev->stat_delivered));
+}
+static DEVICE_ATTR_RO(stats);
+
+static struct attribute *vfm_cap_attrs[] = {
+	&dev_attr_status.attr,
+	&dev_attr_signal_info.attr,
+	&dev_attr_stats.attr,
+	NULL,
+};
+
+static const struct attribute_group vfm_cap_attr_group = {
+	.attrs = vfm_cap_attrs,
+};
+
+static const struct attribute_group *vfm_cap_attr_groups[] = {
+	&vfm_cap_attr_group,
+	NULL,
+};
+
+/* ========== Platform Device (for CMA allocation context) ========== */
+
+static void vfm_cap_pdev_release(struct device *dev)
+{
+	/* No-op for static platform device */
+}
+
+static struct platform_device vfm_cap_pdev = {
+	.name = VFM_CAP_MODULE_NAME,
+	.id = -1,
+	.dev = {
+		.release = vfm_cap_pdev_release,
+	},
+};
+
+/* ========== Module Init/Exit ========== */
+
+static int __init vfm_cap_init(void)
+{
+	struct vfm_cap_dev *dev;
+	struct video_device *vdev;
+	int ret;
+
+	pr_err("vfm_cap: STEP 0 - starting init\n");
+
+	/* TEMPORARY: bail out early to test if module_init is reached */
+	pr_err("vfm_cap: EARLY RETURN - testing module load\n");
+	return -ENODEV;
+
+	vfm_cap_info("initializing (provider=%s, receiver=%s)\n",
+		     provider_name, receiver_name);
+
+	pr_err("vfm_cap: STEP 1 - platform_device_register\n");
+	/* Register platform device for DMA context */
+	ret = platform_device_register(&vfm_cap_pdev);
+	if (ret) {
+		vfm_cap_err("platform_device_register failed: %d\n", ret);
+		return ret;
+	}
+
+	pr_err("vfm_cap: STEP 2 - kzalloc\n");
+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	if (!dev) {
+		ret = -ENOMEM;
+		goto err_unreg_pdev;
+	}
+
+	dev->pdev = &vfm_cap_pdev;
+
+	/* Initialize VFM names */
+	strscpy(dev->recv_name, VFM_CAP_MODULE_NAME,
+		sizeof(dev->recv_name));
+	strscpy(dev->prov_name, VFM_CAP_MODULE_NAME,
+		sizeof(dev->prov_name));
+
+	/* Initialize locks and lists */
+	spin_lock_init(&dev->ready_lock);
+	INIT_LIST_HEAD(&dev->ready_list);
+	INIT_LIST_HEAD(&dev->pending_list);
+	INIT_LIST_HEAD(&dev->consumers);
+	mutex_init(&dev->consumer_lock);
+	spin_lock_init(&dev->consumer_spin);
+	mutex_init(&dev->fmt_lock);
+	spin_lock_init(&dev->fmt_spin);
+	init_waitqueue_head(&dev->wq);
+	INIT_WORK(&dev->deliver_work, vfm_cap_deliver_work);
+
+	/* Initialize frame pool */
+	frame_pool_init(dev);
+
+	/* Initialize statistics */
+	atomic64_set(&dev->stat_frames, 0);
+	atomic64_set(&dev->stat_drops, 0);
+	atomic64_set(&dev->stat_delivered, 0);
+
+	/* Set up DMA mask on platform device */
+	vfm_cap_pdev.dev.dma_mask = &vfm_cap_pdev.dev.coherent_dma_mask;
+	dma_set_coherent_mask(&vfm_cap_pdev.dev, DMA_BIT_MASK(32));
+	dma_set_mask(&vfm_cap_pdev.dev, DMA_BIT_MASK(32));
+
+	pr_err("vfm_cap: STEP 3 - v4l2_device_register\n");
+	/* Register V4L2 device */
+	ret = v4l2_device_register(&vfm_cap_pdev.dev, &dev->v4l2_dev);
+	if (ret) {
+		vfm_cap_err("v4l2_device_register failed: %d\n", ret);
+		goto err_free_dev;
+	}
+
+	/* Configure video device */
+	vdev = &dev->vdev;
+	strscpy(vdev->name, VFM_CAP_MODULE_NAME, sizeof(vdev->name));
+	vdev->v4l2_dev = &dev->v4l2_dev;
+	vdev->fops = &vfm_cap_fops;
+	vdev->ioctl_ops = &vfm_cap_ioctl_ops;
+	vdev->release = video_device_release_empty;
+	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE_MPLANE |
+			    V4L2_CAP_STREAMING;
+	vdev->vfl_type = VFL_TYPE_VIDEO;
+	vdev->vfl_dir = VFL_DIR_RX;
+	vdev->dev.groups = vfm_cap_attr_groups;
+	video_set_drvdata(vdev, dev);
+
+	/* Register video device */
+	pr_err("vfm_cap: STEP 4 - video_register_device\n");
+	ret = video_register_device(vdev, VFL_TYPE_VIDEO, vfm_cap_video_nr);
+	if (ret) {
+		vfm_cap_err("video_register_device failed: %d\n", ret);
+		goto err_unreg_v4l2;
+	}
+
+	vfm_cap_info("registered as /dev/video%d\n", vdev->num);
+
+	/*
+	 * Register VFM receiver. The provider is registered lazily
+	 * when VFRAME_EVENT_PROVIDER_START arrives from upstream.
+	 */
+	pr_err("vfm_cap: STEP 5 - vf_receiver_init + vf_reg_receiver\n");
+	vf_receiver_init(&dev->vf_recv, dev->recv_name,
+			 &vfm_cap_vf_receiver_ops, dev);
+	ret = vf_reg_receiver(&dev->vf_recv);
+	if (ret) {
+		vfm_cap_err("vf_reg_receiver failed: %d\n", ret);
+		goto err_unreg_video;
+	}
+
+	vfm_cap_info("VFM receiver '%s' registered\n", dev->recv_name);
+
+	pr_err("vfm_cap: STEP 6 - all done\n");
+	g_vfm_cap_dev = dev;
+	vfm_cap_info("init complete\n");
+	return 0;
+
+err_unreg_video:
+	video_unregister_device(vdev);
+err_unreg_v4l2:
+	v4l2_device_unregister(&dev->v4l2_dev);
+err_free_dev:
+	kfree(dev);
+err_unreg_pdev:
+	platform_device_unregister(&vfm_cap_pdev);
+	return ret;
+}
+
+static void __exit vfm_cap_exit(void)
+{
+	struct vfm_cap_dev *dev = g_vfm_cap_dev;
+
+	if (!dev)
+		return;
+
+	vfm_cap_info("exiting\n");
+
+	/* Cancel pending V4L2 delivery work */
+	cancel_work_sync(&dev->deliver_work);
+
+	/* Unregister VFM provider if active */
+	if (dev->vfm_started) {
+		vf_unreg_provider(&dev->vf_prov);
+		dev->vfm_started = false;
+	}
+
+	/* Unregister VFM receiver */
+	vf_unreg_receiver(&dev->vf_recv);
+
+	/* Flush frame pool */
+	frame_pool_init(dev);
+
+	/* Unregister V4L2 */
+	video_unregister_device(&dev->vdev);
+	v4l2_device_unregister(&dev->v4l2_dev);
+
+	/* Unregister platform device */
+	platform_device_unregister(&vfm_cap_pdev);
+
+	kfree(dev);
+	g_vfm_cap_dev = NULL;
+
+	vfm_cap_info("exit complete\n");
+}
+
+module_init(vfm_cap_init);
+module_exit(vfm_cap_exit);
+
+MODULE_LICENSE("GPL v2");
+MODULE_AUTHOR("StreamBox");
+MODULE_DESCRIPTION("VFM Capture Tee - Zero-copy V4L2 access to VFM frames");

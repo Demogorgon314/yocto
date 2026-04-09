@@ -1,0 +1,1 @@
+cmd_/home/anshi/yocto/aml-comp/hardware/aml-5.15/amlogic/vfm_cap/Module.symvers := sed 's/\.ko$$/\.o/' /home/anshi/yocto/aml-comp/hardware/aml-5.15/amlogic/vfm_cap/modules.order | scripts/mod/modpost -m  -E -o /home/anshi/yocto/aml-comp/hardware/aml-5.15/amlogic/vfm_cap/Module.symvers -e -v g39962dae2b27-dirty -i Module.symvers   -T -

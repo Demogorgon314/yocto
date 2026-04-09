@@ -1,0 +1,1 @@
+cmd_/home/anshi/yocto/aml-comp/hardware/aml-5.15/amlogic/vfm_cap/modules.order := {   echo /home/anshi/yocto/aml-comp/hardware/aml-5.15/amlogic/vfm_cap/vfm_cap.ko; :; } | awk '!x[$$0]++' - > /home/anshi/yocto/aml-comp/hardware/aml-5.15/amlogic/vfm_cap/modules.order

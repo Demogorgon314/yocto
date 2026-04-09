@@ -2,14 +2,24 @@
 /*
  * vfm_cap.c - VFM Capture Tee Module (Phase 2c - Zero-Copy)
  *
- * Inserts into the VFM chain as:
+ * Operates in two modes, auto-detected at pipeline start:
+ *
+ * Tee mode (downstream receiver present):
  *   vdin0 -> vfm_cap -> deinterlace -> amvideo
+ *   Frames pass through to display path AND are available via V4L2.
+ *
+ * Standalone mode (headless, no downstream receiver):
+ *   vdin0 -> vfm_cap
+ *   Frames are managed purely for V4L2 consumers. No display path.
+ *   Auto-detected when vf_get_receiver() returns NULL (no downstream
+ *   in the VFM chain). Frames without V4L2 consumers are immediately
+ *   recycled back to vdin0.
  *
  * Provides /dev/video_cap as a V4L2 capture device with:
  *   - True zero-copy DMA-buf export of vdin0's CMA frame buffers
  *   - Per-frame reference counting (display path + DMA-buf consumers)
  *   - V4L2 flow control (QBUF/DQBUF) with DMA-buf fd sideband
- *   - Transparent passthrough to display path
+ *   - Transparent passthrough to display path (tee mode)
  *   - V4L2_EVENT_SOURCE_CHANGE for signal detection (Phase 2a)
  *   - 10-bit format awareness (Phase 2b)
  *
@@ -70,6 +80,9 @@ MODULE_PARM_DESC(debug, "Debug level (0=off, 1=info, 2=verbose)");
 
 static struct vfm_cap_dev *g_vfm_cap_dev;
 
+/* Forward declaration - defined after provider/receiver ops */
+static const struct vframe_operations_s vfm_cap_vf_provider_ops;
+
 /* ========== Frame Pool Management ========== */
 
 /**
@@ -91,6 +104,45 @@ static void frame_pool_init(struct vfm_cap_dev *dev)
 		INIT_LIST_HEAD(&dev->frame_pool[i].list);
 		INIT_LIST_HEAD(&dev->frame_pool[i].pending_node);
 	}
+}
+
+/**
+ * frame_pool_recycle_all() - Recycle all in-use frames back to vdin0
+ *
+ * Must be called with ready_lock held.
+ * Properly returns all held vframes to upstream before pool reinit.
+ * Also clears prev_v4l2_frame (dropping its held reference).
+ */
+static void frame_pool_recycle_all(struct vfm_cap_dev *dev)
+{
+	int i;
+
+	/* Clear the held-back V4L2 frame pointer first — the loop below
+	 * will recycle the underlying vframe along with all others.
+	 * No need to decrement refcount separately since we're about to
+	 * force-reset all refcounts to 0. */
+	dev->prev_v4l2_frame = NULL;
+
+	for (i = 0; i < VFM_CAP_POOL_SIZE; i++) {
+		struct cap_frame *frame = &dev->frame_pool[i];
+
+		if (!frame->in_use)
+			continue;
+
+		if (frame->vf) {
+			vf_put(frame->vf, dev->recv_name);
+			vf_notify_provider(dev->recv_name,
+					   VFRAME_EVENT_RECEIVER_PUT, NULL);
+			frame->vf = NULL;
+		}
+		frame->in_use = false;
+		atomic_set(&frame->refcount, 0);
+		list_del_init(&frame->list);
+		list_del_init(&frame->pending_node);
+	}
+
+	INIT_LIST_HEAD(&dev->ready_list);
+	INIT_LIST_HEAD(&dev->pending_list);
 }
 
 /**
@@ -547,7 +599,11 @@ static void vfm_cap_queue_source_change(struct vfm_cap_dev *dev, u32 changes)
  * vfm_cap_drain_pending() - Flush pending V4L2 frames during signal loss
  *
  * Called from sm_poll_work (process context) when signal goes unstable.
- * Removes all frames from pending_list and releases their V4L2 references.
+ * Removes all frames from pending_list and drops their V4L2 (held) refs.
+ *
+ * We do all refcount manipulation under ready_lock to avoid races with
+ * PROVIDER_RESET / frame_pool_recycle_all() which may run concurrently
+ * from ISR context and force-reset all refcounts.
  */
 static void vfm_cap_drain_pending(struct vfm_cap_dev *dev)
 {
@@ -558,20 +614,36 @@ static void vfm_cap_drain_pending(struct vfm_cap_dev *dev)
 
 	spin_lock_irqsave(&dev->ready_lock, flags);
 	list_splice_init(&dev->pending_list, &drain_list);
-	spin_unlock_irqrestore(&dev->ready_lock, flags);
+	/* Also release the held-back frame — signal is lost/unstable */
+	if (dev->prev_v4l2_frame) {
+		list_add_tail(&dev->prev_v4l2_frame->pending_node,
+			      &drain_list);
+		dev->prev_v4l2_frame = NULL;
+	}
 
+	/*
+	 * Drop the V4L2/pending ref for each frame while still under lock.
+	 * This avoids a race with frame_pool_recycle_all() (called from ISR
+	 * context on PROVIDER_RESET) which force-resets all refcounts to 0.
+	 * If we dropped refs outside the lock, recycle_all could run between
+	 * the splice and the dec, corrupting the refcount.
+	 *
+	 * We inline the refcount-dec + conditional release here because
+	 * frame_put() takes ready_lock internally and would deadlock.
+	 */
 	list_for_each_entry_safe(frame, tmp, &drain_list, pending_node) {
 		list_del_init(&frame->pending_node);
-		frame_put(dev, frame);
+		if (atomic_dec_and_test(&frame->refcount)) {
+			/* Last ref — recycle vframe back to vdin0 */
+			frame_release(dev, frame);
+		}
 		count++;
 	}
+	spin_unlock_irqrestore(&dev->ready_lock, flags);
 
 	if (count > 0)
 		vfm_cap_dbg(1, "drained %d pending frames\n", count);
 }
-
-/* Forward declaration - defined after provider/receiver ops */
-static const struct vframe_operations_s vfm_cap_vf_provider_ops;
 
 /**
  * vfm_cap_sm_poll_work() - Periodic signal state machine monitor
@@ -653,37 +725,6 @@ static void vfm_cap_sm_poll_work(struct work_struct *work)
 			 */
 			vfm_cap_info("signal stable, exiting drain mode\n");
 			dev->draining = false;
-
-			/*
-			 * If we were loaded into an already-running pipeline
-			 * (e.g. rmmod + insmod while vdin0 is streaming),
-			 * we never received VFRAME_EVENT_PROVIDER_START.
-			 * Detect this and self-register the VFM provider so
-			 * frames can flow through the tee to downstream.
-			 */
-			if (!dev->vfm_started) {
-				unsigned long pflags;
-
-				vfm_cap_info("late start: provider not registered, self-registering\n");
-
-				spin_lock_irqsave(&dev->ready_lock, pflags);
-				frame_pool_init(dev);
-				INIT_LIST_HEAD(&dev->ready_list);
-				INIT_LIST_HEAD(&dev->pending_list);
-				spin_unlock_irqrestore(&dev->ready_lock, pflags);
-
-				if (vf_get_receiver(dev->prov_name)) {
-					vf_provider_init(&dev->vf_prov,
-							 dev->prov_name,
-							 &vfm_cap_vf_provider_ops,
-							 dev);
-					vf_reg_provider(&dev->vf_prov);
-					vf_notify_receiver(dev->prov_name,
-						VFRAME_EVENT_PROVIDER_START,
-						NULL);
-				}
-				dev->vfm_started = true;
-			}
 		}
 	}
 
@@ -968,44 +1009,83 @@ static int vfm_cap_recv_event_cb(int type, void *data, void *private_data)
 		 * Upstream says "start streaming". Register our provider
 		 * to connect to downstream (deinterlace).
 		 * This follows the amlvideo.c pattern exactly.
+		 *
+		 * Standalone mode: if no downstream receiver exists in
+		 * the VFM chain (headless: path is "vdin0 vfm_cap" only),
+		 * skip provider registration entirely. Frames will be
+		 * managed purely for V4L2 consumers.
+		 *
+		 * If we previously registered as a provider (from a prior
+		 * PROVIDER_START with a different VFM path), unregister
+		 * first to avoid duplicate-name errors in vf_reg_provider().
 		 */
-		vfm_cap_info("PROVIDER_START: registering provider '%s'\n",
-			     dev->prov_name);
+		vfm_cap_info("PROVIDER_START: checking downstream for '%s' "
+			     "(was standalone=%d, vfm_started=%d)\n",
+			     dev->prov_name, dev->standalone,
+			     dev->vfm_started);
+
+		/* Clean up stale provider registration from previous path */
+		if (dev->vfm_started && !dev->standalone) {
+			vfm_cap_info("PROVIDER_START: unreg stale provider "
+				     "before re-evaluation\n");
+			vf_unreg_provider(&dev->vf_prov);
+		}
 
 		spin_lock_irqsave(&dev->ready_lock, flags);
+		frame_pool_recycle_all(dev);
 		frame_pool_init(dev);
-		INIT_LIST_HEAD(&dev->ready_list);
-		INIT_LIST_HEAD(&dev->pending_list);
+		dev->prev_v4l2_frame = NULL;
 		spin_unlock_irqrestore(&dev->ready_lock, flags);
 
 		if (vf_get_receiver(dev->prov_name)) {
+			dev->standalone = false;
+			vfm_cap_info("TEE mode: downstream receiver found\n");
 			vf_provider_init(&dev->vf_prov, dev->prov_name,
 					 &vfm_cap_vf_provider_ops, dev);
 			vf_reg_provider(&dev->vf_prov);
 			vf_notify_receiver(dev->prov_name,
 					   VFRAME_EVENT_PROVIDER_START, NULL);
+		} else {
+			dev->standalone = true;
+			vfm_cap_info("STANDALONE mode: no downstream receiver, "
+				     "frames managed for V4L2 only\n");
 		}
 		dev->vfm_started = true;
 
 	} else if (type == VFRAME_EVENT_PROVIDER_UNREG) {
 		/*
 		 * Upstream is going away. Unregister our provider.
+		 *
+		 * NOTE: We must NOT rely on vf_get_receiver() here because
+		 * the VFM map entry may already be removed by the time this
+		 * event fires (e.g. when tvpath is removed then re-added
+		 * with a different chain). If the map is gone,
+		 * vf_get_receiver() returns NULL and we'd skip the unreg,
+		 * leaving a stale provider registration that blocks future
+		 * vf_reg_provider() calls (duplicate name check).
+		 *
+		 * Instead, unconditionally unregister if we registered
+		 * (i.e. vfm_started && !standalone).
 		 */
-		vfm_cap_info("PROVIDER_UNREG: unregistering provider\n");
+		vfm_cap_info("PROVIDER_UNREG: unregistering provider "
+			     "(standalone=%d)\n", dev->standalone);
 
-		if (vf_get_receiver(dev->prov_name))
+		if (!dev->standalone) {
+			vfm_cap_info("PROVIDER_UNREG: unreg provider '%s'\n",
+				     dev->prov_name);
 			vf_unreg_provider(&dev->vf_prov);
+		}
 
 		/* Cancel any pending V4L2 delivery work */
 		cancel_work_sync(&dev->deliver_work);
 
 		/* Flush the frame pool - release any held frames */
 		spin_lock_irqsave(&dev->ready_lock, flags);
+		frame_pool_recycle_all(dev);
 		frame_pool_init(dev);
-		INIT_LIST_HEAD(&dev->ready_list);
-		INIT_LIST_HEAD(&dev->pending_list);
 		spin_unlock_irqrestore(&dev->ready_lock, flags);
 
+		dev->prev_v4l2_frame = NULL;
 		dev->vfm_started = false;
 
 	} else if (type == VFRAME_EVENT_PROVIDER_REG) {
@@ -1040,6 +1120,18 @@ static int vfm_cap_recv_event_cb(int type, void *data, void *private_data)
 		 */
 		if (states.buf_avail_num > 0 || pool_free > 0)
 			return RECEIVER_ACTIVE;
+
+		/*
+		 * Standalone mode: no downstream to query. If pool is
+		 * exhausted, report INACTIVE so vdin0 can reclaim.
+		 */
+		if (dev->standalone) {
+			vfm_cap_err("QUREY_STATE: INACTIVE (standalone)! "
+				    "pool %d/%d in_use, ready=%d\n",
+				    pool_in_use, VFM_CAP_POOL_SIZE,
+				    states.buf_avail_num);
+			return RECEIVER_INACTIVE;
+		}
 
 		/* Also check downstream */
 		downstream_state = vf_notify_receiver(dev->prov_name,
@@ -1089,6 +1181,48 @@ static int vfm_cap_recv_event_cb(int type, void *data, void *private_data)
 
 		atomic64_inc(&dev->stat_frames);
 
+		/*
+		 * If we were loaded into an already-running pipeline
+		 * (e.g. rmmod + insmod while vdin0 is streaming),
+		 * we never received VFRAME_EVENT_PROVIDER_START.
+		 * Detect this and self-register the VFM provider so
+		 * frames can flow through the tee to downstream.
+		 *
+		 * Standalone mode: skip provider registration (no downstream).
+		 */
+		if (!dev->vfm_started) {
+			unsigned long pflags;
+
+			vfm_cap_info("late start: provider not registered, "
+				     "self-registering (standalone=%d)\n",
+				     dev->standalone);
+
+			spin_lock_irqsave(&dev->ready_lock, pflags);
+			frame_pool_recycle_all(dev);
+			frame_pool_init(dev);
+			dev->prev_v4l2_frame = NULL;
+			spin_unlock_irqrestore(&dev->ready_lock, pflags);
+
+			if (vf_get_receiver(dev->prov_name)) {
+				dev->standalone = false;
+				vfm_cap_info("late start: TEE mode "
+					     "(downstream found)\n");
+				vf_provider_init(&dev->vf_prov,
+						 dev->prov_name,
+						 &vfm_cap_vf_provider_ops,
+						 dev);
+				vf_reg_provider(&dev->vf_prov);
+				vf_notify_receiver(dev->prov_name,
+					VFRAME_EVENT_PROVIDER_START,
+					NULL);
+			} else {
+				dev->standalone = true;
+				vfm_cap_info("late start: STANDALONE mode "
+					     "(no downstream)\n");
+			}
+			dev->vfm_started = true;
+		}
+
 		/* Update format on first frame or format change */
 		fmt_changed = vfm_cap_update_format(dev, vf);
 
@@ -1105,9 +1239,18 @@ static int vfm_cap_recv_event_cb(int type, void *data, void *private_data)
 		 * (no SM transition, just format change within stable signal),
 		 * queue SOURCE_CHANGE. This is safe from ISR context because
 		 * v4l2_event_queue() uses spin_lock_irqsave internally.
+		 *
+		 * Flush the frame pool to prevent "unknown vframe idx" errors
+		 * when resolution changes. Old frames from previous resolution
+		 * cannot be matched when downstream returns them.
 		 */
 		if (fmt_changed) {
 			unsigned long eflags;
+
+			/* Recycle all frames from pool - they have old format */
+			spin_lock_irqsave(&dev->ready_lock, eflags);
+			frame_pool_recycle_all(dev);
+			spin_unlock_irqrestore(&dev->ready_lock, eflags);
 
 			spin_lock_irqsave(&dev->fmt_spin, eflags);
 			vfm_cap_build_signal_info(dev, &dev->sig_info,
@@ -1169,32 +1312,113 @@ static int vfm_cap_recv_event_cb(int type, void *data, void *private_data)
 		/*
 		 * Set refcount:
 		 *   1 = display path (downstream will get/put)
-		 *  +1 = V4L2 delivery work (if consumers streaming and not draining)
+		 *
+		 * The V4L2 reference (+1) is NOT set on the current frame.
+		 * Instead, we use a one-frame delay: the PREVIOUS frame
+		 * (prev_v4l2_frame) is delivered to V4L2 consumers.
+		 * This ensures V4L2/DMA-buf consumers only see fully-written
+		 * frames, eliminating tearing from vdin0's VRR write phase.
 		 *
 		 * Additional refs are taken by vfm_cap_export_frame_dmabuf()
 		 * when the consumer requests DMA-buf fds.
+		 *
+		 * Standalone mode: no display path, so no base refcount of 1.
+		 * Frames are managed purely for V4L2. If no V4L2 consumers
+		 * are streaming, recycle immediately.
 		 */
-		if (want_v4l2)
-			atomic_set(&frame->refcount, 2);
-		else
+		if (dev->standalone) {
+			/*
+			 * Standalone: no downstream display path.
+			 * Refcount is purely for V4L2 consumers.
+			 */
+			if (want_v4l2) {
+				struct cap_frame *prev = dev->prev_v4l2_frame;
+
+				/* refcount=1 for the held V4L2 ref */
+				atomic_set(&frame->refcount, 1);
+				dev->prev_v4l2_frame = frame;
+
+				if (prev) {
+					/*
+					 * Previous frame fully written.
+					 * Its refcount was set to 1 when held;
+					 * that ref transfers to pending_list.
+					 */
+					list_add_tail(&prev->pending_node,
+						      &dev->pending_list);
+				}
+			} else {
+				/*
+				 * No V4L2 consumers: recycle immediately.
+				 * Don't add to any list — just put back.
+				 */
+				frame->in_use = false;
+				spin_unlock_irqrestore(&dev->ready_lock,
+						       flags);
+				vf_put(vf, dev->recv_name);
+				vf_notify_provider(dev->recv_name,
+					VFRAME_EVENT_RECEIVER_PUT, NULL);
+				frame->vf = NULL;
+				/* Wake pollers, schedule work if pending */
+				if (!list_empty(&dev->pending_list))
+					schedule_work(&dev->deliver_work);
+				wake_up_interruptible(&dev->wq);
+				return 0;
+			}
+		} else {
+			/*
+			 * Tee mode: display path gets base refcount of 1.
+			 */
 			atomic_set(&frame->refcount, 1);
 
-		/* Add to ready list for downstream to pick up */
-		list_add_tail(&frame->list, &dev->ready_list);
+			/* Add to ready list for downstream to pick up */
+			list_add_tail(&frame->list, &dev->ready_list);
 
-		/* Add to pending list for V4L2 delivery if needed */
-		if (want_v4l2)
-			list_add_tail(&frame->pending_node,
-				      &dev->pending_list);
+			/*
+			 * One-frame delay for V4L2 delivery (tearing fix):
+			 *
+			 * Instead of delivering the current frame (which may
+			 * still be under active DMA write by vdin0), we
+			 * deliver the PREVIOUS frame which is guaranteed
+			 * complete.
+			 *
+			 * Flow:
+			 *   Frame N arrives:
+			 *     - prev_v4l2_frame (N-1) -> pending_list
+			 *     - current frame N -> saved as prev_v4l2_frame
+			 *   Frame N+1 arrives:
+			 *     - prev_v4l2_frame (N) -> pending_list
+			 *     - current frame N+1 -> saved as prev_v4l2_frame
+			 *
+			 * The first frame after start has no previous, so
+			 * it's held and delivered when the second frame
+			 * arrives (one-frame startup latency, acceptable
+			 * for streaming).
+			 */
+			if (want_v4l2) {
+				struct cap_frame *prev = dev->prev_v4l2_frame;
+
+				/* Bump refcount for the held ref */
+				atomic_inc(&frame->refcount);
+				dev->prev_v4l2_frame = frame;
+
+				if (prev) {
+					list_add_tail(&prev->pending_node,
+						      &dev->pending_list);
+				}
+			}
+		}
 
 		spin_unlock_irqrestore(&dev->ready_lock, flags);
 
-		/* Notify downstream that a frame is ready */
-		vf_notify_receiver(dev->prov_name,
-				   VFRAME_EVENT_PROVIDER_VFRAME_READY, NULL);
+		/* Notify downstream that a frame is ready (tee mode only) */
+		if (!dev->standalone)
+			vf_notify_receiver(dev->prov_name,
+					   VFRAME_EVENT_PROVIDER_VFRAME_READY,
+					   NULL);
 
-		/* Schedule V4L2 delivery work (zero-copy DMA-buf export) */
-		if (want_v4l2)
+		/* Schedule V4L2 delivery work if we queued a previous frame */
+		if (want_v4l2 && !list_empty(&dev->pending_list))
 			schedule_work(&dev->deliver_work);
 
 		/* Wake up any polling consumers */
@@ -1204,22 +1428,26 @@ static int vfm_cap_recv_event_cb(int type, void *data, void *private_data)
 		vfm_cap_info("PROVIDER_RESET\n");
 
 		spin_lock_irqsave(&dev->ready_lock, flags);
+		frame_pool_recycle_all(dev);
 		frame_pool_init(dev);
-		INIT_LIST_HEAD(&dev->ready_list);
-		INIT_LIST_HEAD(&dev->pending_list);
 		spin_unlock_irqrestore(&dev->ready_lock, flags);
 
-		/* Forward reset downstream */
-		vf_notify_receiver(dev->prov_name,
-				   VFRAME_EVENT_PROVIDER_RESET, data);
+		/* Forward reset downstream (tee mode only) */
+		if (!dev->standalone)
+			vf_notify_receiver(dev->prov_name,
+					   VFRAME_EVENT_PROVIDER_RESET, data);
 
 	} else if (type == VFRAME_EVENT_PROVIDER_FR_HINT) {
-		/* Pass through frame rate hint */
-		vf_notify_receiver(dev->prov_name,
-				   VFRAME_EVENT_PROVIDER_FR_HINT, data);
+		/* Pass through frame rate hint (tee mode only) */
+		if (!dev->standalone)
+			vf_notify_receiver(dev->prov_name,
+					   VFRAME_EVENT_PROVIDER_FR_HINT,
+					   data);
 	} else if (type == VFRAME_EVENT_PROVIDER_FR_END_HINT) {
-		vf_notify_receiver(dev->prov_name,
-				   VFRAME_EVENT_PROVIDER_FR_END_HINT, data);
+		if (!dev->standalone)
+			vf_notify_receiver(dev->prov_name,
+					   VFRAME_EVENT_PROVIDER_FR_END_HINT,
+					   data);
 	}
 
 	return 0;
@@ -1572,44 +1800,26 @@ static int vfm_cap_ioctl_get_dmabuf(struct vfm_cap_consumer *cons,
 
 	/*
 	 * Create a new fd for the DMA-buf.
-	 *
-	 * dma_buf_export() created the dma_buf with file refcount=1.
-	 * dma_buf_fd() below calls fd_install() which does NOT increment
-	 * the file refcount — it merely associates the fd with the file
-	 * in the process fd table. So after dma_buf_fd(), both buf->dbuf
-	 * and the process fd share the single refcount=1.
-	 *
-	 * Problem: when userspace calls close(fd), fput() drops refcount
-	 * to 0, triggering dma_buf_release(). But buf->dbuf still holds
-	 * a pointer, and buf_queue() will call dma_buf_put(buf->dbuf)
-	 * on QBUF — a use-after-free! Additionally, if a Vulkan consumer
-	 * has dma_buf_attach()'d via the fd, the dma_buf_release fires
-	 * with a non-empty attachment list: WARN_ON in dma-buf.c:107.
-	 *
-	 * Fix: take an extra reference via get_dma_buf() before creating
-	 * the fd. This gives refcount=2:
-	 *   - One ref for the process fd (consumed by close())
-	 *   - One ref for buf->dbuf (consumed by dma_buf_put in buf_queue)
-	 *
-	 * Lifecycle after fix:
-	 *   export: refcount=1
-	 *   get_dma_buf: refcount=2
-	 *   dma_buf_fd: refcount=2 (fd_install is refcount-neutral)
-	 *   close(fd): refcount=1 (buf->dbuf ref keeps dma_buf alive)
-	 *   QBUF → buf_queue → dma_buf_put: refcount=0 → clean release
-	 *
-	 * If consumer also dup()'d + Vulkan-imported the fd, Mali holds
-	 * additional refs, so refcount stays >0 until Mali releases.
+	 * dma_buf_fd() installs the fd in the calling process's fd table.
+	 * The fd holds an additional reference on the dma_buf (via
+	 * dma_buf_get/put), so the dma_buf stays alive until the consumer
+	 * closes the fd, even if the vb2 buffer is re-queued.
 	 */
-	get_dma_buf(buf->dbuf);
 	fd = dma_buf_fd(buf->dbuf, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
-		/* Undo the get_dma_buf since fd creation failed */
-		dma_buf_put(buf->dbuf);
 		vfm_cap_err("dma_buf_fd failed: %d\n", fd);
 		return fd;
 	}
 
+	/*
+	 * dma_buf_fd() consumes our dma_buf reference — the fd now
+	 * owns it. When userspace closes the fd, dma_buf refcount
+	 * drops to 0 and dma_buf is freed. But we still hold
+	 * buf->dbuf and will call dma_buf_put() on it in buf_queue
+	 * cleanup. Take an extra reference so both the fd and our
+	 * buf->dbuf each hold one independently.
+	 */
+	get_dma_buf(buf->dbuf);
 	buf->dbuf_fd = fd;
 	req->fd = fd;
 	req->size = buf->frame ? buf->frame->buf_size : 0;
@@ -1801,6 +2011,25 @@ static int vfm_cap_release(struct file *file)
 
 	vfm_cap_info("consumer %u closed (remaining: %u)\n",
 		     cons->id, dev->num_consumers);
+
+	/*
+	 * Auto-drain: when the last V4L2 consumer closes, recycle any
+	 * stuck pool frames back to vdin0.  With zero consumers there
+	 * can be no V4L2/DMA-buf references, so every in_use frame is
+	 * held only by the display path.  Returning them now prevents
+	 * vdin0 write-buffer exhaustion (the "freeze after first run" bug).
+	 */
+	if (dev->num_consumers == 0) {
+		/* Cancel pending delivery — no consumers to deliver to */
+		cancel_work_sync(&dev->deliver_work);
+
+		spin_lock_irqsave(&dev->ready_lock, flags);
+		frame_pool_recycle_all(dev);
+		spin_unlock_irqrestore(&dev->ready_lock, flags);
+
+		vfm_cap_info("auto-drain: recycled all frames to vdin0\n");
+	}
+
 	kfree(cons);
 	return 0;
 }
@@ -1848,11 +2077,13 @@ static ssize_t status_show(struct device *device,
 
 	return scnprintf(buf, PAGE_SIZE,
 			 "vfm_started: %d\n"
+			 "standalone: %d\n"
 			 "consumers: %u\n"
 			 "fmt_valid: %d\n"
 			 "sm_state: %d\n"
 			 "draining: %d\n",
 			 dev->vfm_started,
+			 dev->standalone,
 			 dev->num_consumers,
 			 dev->fmt_valid,
 			 dev->sm_state,
@@ -1975,7 +2206,6 @@ static ssize_t pool_drain_store(struct device *device,
 {
 	struct vfm_cap_dev *dev = g_vfm_cap_dev;
 	unsigned long flags;
-	int i, drained = 0;
 
 	if (!dev)
 		return -ENODEV;
@@ -1986,33 +2216,10 @@ static ssize_t pool_drain_store(struct device *device,
 	cancel_work_sync(&dev->deliver_work);
 
 	spin_lock_irqsave(&dev->ready_lock, flags);
-	for (i = 0; i < VFM_CAP_POOL_SIZE; i++) {
-		struct cap_frame *frame = &dev->frame_pool[i];
-
-		if (frame->in_use) {
-			vfm_cap_info("  drain slot %d: refcount=%d vf_idx=%u\n",
-				     i, atomic_read(&frame->refcount),
-				     frame->vf ? frame->vf->index : 0xFFFF);
-			/* Force-release: recycle vframe to vdin0 */
-			if (frame->vf) {
-				vf_put(frame->vf, dev->recv_name);
-				vf_notify_provider(dev->recv_name,
-						   VFRAME_EVENT_RECEIVER_PUT,
-						   NULL);
-				frame->vf = NULL;
-			}
-			frame->in_use = false;
-			atomic_set(&frame->refcount, 0);
-			list_del_init(&frame->list);
-			list_del_init(&frame->pending_node);
-			drained++;
-		}
-	}
-	INIT_LIST_HEAD(&dev->ready_list);
-	INIT_LIST_HEAD(&dev->pending_list);
+	frame_pool_recycle_all(dev);
 	spin_unlock_irqrestore(&dev->ready_lock, flags);
 
-	vfm_cap_info("FORCE DRAIN: released %d frames\n", drained);
+	vfm_cap_info("FORCE DRAIN: complete\n");
 	return count;
 }
 static DEVICE_ATTR_WO(pool_drain);
@@ -2100,7 +2307,9 @@ static int __init vfm_cap_init(void)
 	dev->sm_state = VFM_SM_NULL;
 	dev->sm_polling = false;
 	dev->draining = false;
+	dev->standalone = false;
 	dev->last_signal_type = 0;
+	dev->prev_v4l2_frame = NULL;
 	memset(&dev->sig_info, 0, sizeof(dev->sig_info));
 
 	/* Initialize frame pool */
@@ -2208,17 +2417,27 @@ static void __exit vfm_cap_exit(void)
 	/* Cancel pending V4L2 delivery work */
 	cancel_work_sync(&dev->deliver_work);
 
-	/* Unregister VFM provider if active */
-	if (dev->vfm_started) {
+	/* Unregister VFM provider if active (not in standalone mode) */
+	if (dev->vfm_started && !dev->standalone) {
 		vf_unreg_provider(&dev->vf_prov);
 		dev->vfm_started = false;
 	}
 
+	/*
+	 * Flush frame pool BEFORE unregistering VFM receiver, so that
+	 * vf_put() calls inside frame_pool_recycle_all() go through
+	 * the still-registered receiver path.
+	 */
+	{
+		unsigned long flags;
+
+		spin_lock_irqsave(&dev->ready_lock, flags);
+		frame_pool_recycle_all(dev);
+		spin_unlock_irqrestore(&dev->ready_lock, flags);
+	}
+
 	/* Unregister VFM receiver */
 	vf_unreg_receiver(&dev->vf_recv);
-
-	/* Flush frame pool */
-	frame_pool_init(dev);
 
 	/* Unregister V4L2 */
 	video_unregister_device(&dev->vdev);
