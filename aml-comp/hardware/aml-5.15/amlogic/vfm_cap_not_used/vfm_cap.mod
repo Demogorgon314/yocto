@@ -1,1 +1,0 @@
-/home/anshi/yocto/aml-comp/hardware/aml-5.15/amlogic/vfm_cap/vfm_cap.o
