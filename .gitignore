@@ -11,3 +11,7 @@ aml-comp/hardware/aml-5.15/amlogic/vfm_cap/*.mod.o
 aml-comp/hardware/aml-5.15/amlogic/vfm_cap/*.o
 aml-comp/hardware/aml-5.15/amlogic/vfm_cap/Module.symvers
 aml-comp/hardware/aml-5.15/amlogic/vfm_cap/modules.order
+sbs/
+one-kvm-streambox/
+openspec/
+.opencode/
