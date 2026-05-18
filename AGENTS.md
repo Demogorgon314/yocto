@@ -83,6 +83,10 @@
 - Some Windows HDR sources may report `bitdepth=8` while still carrying HDR EOTF/status. Treat HDMI EOTF/HDR status as authoritative for passthrough; do not require bitdepth=10 to select P010.
 - For true HDR WebRTC testing, use stream mode `h265` plus `HDR Passthrough`. The H.265 session should log `main10=true`, SDP offer/answer should contain H.265, and the AML pipeline should be rebuilt as `codec=H265 img_format=P010`.
 - H.265 codec switches must not reuse a running H.264 pipeline. `ensure_video_pipeline` intentionally compares the existing pipeline config against the requested codec/HDR/resolution/fps/backend and recreates it on mismatch.
+- VIM4 HDMI capture should use the Amlogic VFM/VML path through `libvfmcap`, not direct generic V4L2 frame handling. `/dev/video_cap` may report the current kernel format as `AMLY` (`Amlogic YUV 4:2:2 10-bit packed`), but the working One-KVM path opens vfmcap with `VfmcapOutputFmt::Nv12` or `P010` and feeds DMA-buf frames directly to the Amlogic encoder.
+- A healthy SDR path logs `AML pipeline: capture opened 1920x1080 @ 60fps img_format=Nv12`, then `first frame ... fmt=0x3231564e` (`NV12`) and continuing `encoded frame` messages.
+- If HDMI source changes and the log shows repeated `vfmcap_acquire_frame failed (rc=-5): Vulkan render failed: vkCreateImage failed: -1000158000`, treat it as a stale vfmcap/Vulkan import state. The AML pipeline should stop and rebuild instead of waiting forever for a reconfigured frame.
+- After a bad vfmcap state during development, a `systemctl restart one-kvm.service` can recover once HDMI RX is stable. Check `journalctl -u streambox-tv.service` for `[HEADLESS] Stable signal detected` and `/sys/class/hdmirx/hdmirx0/info` for the actual input mode.
 
 ## Sunshine / Moonlight Notes
 - Reference implementation source is `/home/wangkai/github/Sunshine`.
