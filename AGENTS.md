@@ -1,0 +1,62 @@
+# Codex Notes for This Yocto Workspace
+
+## Workspace
+- Root: `/home/wangkai/github/yocto`
+- Target board: `mesont7c-kvim4-5.15` / VIM4
+- This workspace uses submodules. Keep changes scoped to the module being worked on.
+- Do not commit generated build config churn, `node_modules`, or unrelated submodule dirt.
+
+## Build Rules
+- Build Yocto inside Docker. Do not run host/WSL `bitbake` for this tree.
+- Use the `streambox-builder` image and initialize the Amlogic environment with:
+  `source meta-meson/aml-setenv.sh mesont7c-kvim4-5.15`
+- Correct one-kvm package build command:
+  ```sh
+  docker run --rm \
+    -v /home/wangkai/github/yocto:/workspace \
+    -w /workspace \
+    -e LOCAL_UID=1000 \
+    -e LOCAL_GID=1000 \
+    streambox-builder \
+    /bin/bash -lc 'source meta-meson/aml-setenv.sh mesont7c-kvim4-5.15 >/tmp/aml-setenv.log && bitbake -c clean one-kvm && bitbake one-kvm'
+  ```
+- Expected one-kvm IPK output:
+  `build/tmp/deploy/ipk/armv8a/one-kvm_git-r0_armv8a.ipk`
+
+## One-KVM Development
+- Local source: `/home/wangkai/github/yocto/one-kvm`
+- Fork remote: `git@github.com:Demogorgon314/One-KVM-StreamBox.git`
+- Current development branch: `sync-upstream-main`
+- After changing frontend code:
+  ```sh
+  cd /home/wangkai/github/yocto/one-kvm/web
+  npm ci
+  npm run build
+  cd /home/wangkai/github/yocto/one-kvm
+  tar czf /home/wangkai/github/yocto/meta-aml-cfg/recipes-kvm/one-kvm/files/one-kvm-web-dist.tar.gz web/dist
+  ```
+
+## Yocto Layer Wiring
+- Yocto layer: `/home/wangkai/github/yocto/meta-aml-cfg`
+- Fork remote: `git@github.com:Demogorgon314/meta-aml-cfg.git`
+- one-kvm recipe: `meta-aml-cfg/recipes-kvm/one-kvm/one-kvm_git.bb`
+- When one-kvm source changes are pushed, update `SRCREV` in the recipe to the pushed one-kvm commit.
+- If frontend changed, also update:
+  `meta-aml-cfg/recipes-kvm/one-kvm/files/one-kvm-web-dist.tar.gz`
+
+## Board Test / Install
+- Board IP used for local testing: `192.168.172.1`
+- SSH user/password: `root` / `Streamb0x`
+- Quick install:
+  ```sh
+  sshpass -p Streamb0x scp -o StrictHostKeyChecking=no build/tmp/deploy/ipk/armv8a/one-kvm_git-r0_armv8a.ipk root@192.168.172.1:/tmp/one-kvm_git-r0_armv8a.ipk
+  sshpass -p Streamb0x ssh -o StrictHostKeyChecking=no root@192.168.172.1 'opkg install --force-reinstall /tmp/one-kvm_git-r0_armv8a.ipk && systemctl daemon-reload && systemctl restart one-kvm'
+  ```
+
+## HDR / Video Notes
+- Current one-kvm HDR work is in commit `dd174fbdc04fa5bf4f7dcb797b943603acd29b18`.
+- Yocto layer bump for that work is `meta-aml-cfg` commit `2f774c8`.
+- `HDR Auto` keeps browser-compatible behavior and tone maps HDR to SDR where needed.
+- `SDR Only` forces SDR output.
+- `HDR Passthrough` is experimental true HDR passthrough using 10-bit P010 capture. Browser/WebRTC HDR support may still be limited by client, codec, and display.
+- HDR/SDR input changes should trigger the AML video pipeline to rebuild and request WebRTC session reconnect, even when resolution does not change.
