@@ -54,9 +54,9 @@
   ```
 
 ## HDR / Video Notes
-- Current one-kvm HDR work is in commit `dd174fbdc04fa5bf4f7dcb797b943603acd29b18`.
-- Yocto layer bump for that work is `meta-aml-cfg` commit `2f774c8`.
+- Current verified one-kvm HDR/hot-switch work is commit `909c21c300528cddeb6af0b744e9170d6ab01caf`.
+- Yocto `one-kvm_git.bb` must pin `SRCREV` to that commit or newer.
 - `HDR Auto` keeps browser-compatible behavior and tone maps HDR to SDR where needed.
 - `SDR Only` forces SDR output.
 - `HDR Passthrough` is experimental true HDR passthrough using 10-bit P010 capture. Browser/WebRTC HDR support may still be limited by client, codec, and display.
-- HDR/SDR input changes should trigger the AML video pipeline to rebuild and request WebRTC session reconnect, even when resolution does not change.
+- HDR/SDR input changes should trigger the AML video pipeline to rebuild, close stale WebRTC sessions, and force the browser to negotiate a fresh WebRTC session. Do not reconnect old sessions directly to the new pipeline; that can show one frame and then freeze.
