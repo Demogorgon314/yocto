@@ -3,7 +3,12 @@
 ## Workspace
 - Root: `/home/wangkai/github/yocto`
 - Target board: `mesont7c-kvim4-5.15` / VIM4
-- This workspace uses submodules. Keep changes scoped to the module being worked on.
+- This workspace uses submodules. Treat this checkout as the Yocto integration
+  and image-build workspace, not the primary feature-development workspace.
+- Use `/home/wangkai/github/vim4` for feature development in source
+  submodules. Commit and push the source submodule there first, then update
+  this workspace only to pin the tested submodule revision and build the image.
+- Keep changes scoped to the module being worked on.
 - Do not commit generated build config churn, `node_modules`, or unrelated submodule dirt.
 
 ## Build Rules
@@ -37,15 +42,16 @@
   `build/tmp/work/armv8a-poky-linux/one-kvm/git-r0/packages-split/one-kvm/usr/bin/one-kvm`
 
 ## One-KVM Development
-- Local source: `/home/wangkai/github/yocto/one-kvm`
+- Primary local source: `/home/wangkai/github/vim4/one-kvm`
+- Yocto integration copy/submodule: `/home/wangkai/github/yocto/one-kvm`
 - Fork remote: `git@github.com:Demogorgon314/One-KVM-StreamBox.git`
 - Current development branch: `sync-upstream-main`
 - After changing frontend code:
   ```sh
-  cd /home/wangkai/github/yocto/one-kvm/web
+  cd /home/wangkai/github/vim4/one-kvm/web
   npm ci
   npm run build
-  cd /home/wangkai/github/yocto/one-kvm
+  cd /home/wangkai/github/vim4/one-kvm
   tar czf /home/wangkai/github/yocto/meta-aml-cfg/recipes-kvm/one-kvm/files/one-kvm-web-dist.tar.gz web/dist
   ```
 
@@ -90,11 +96,11 @@
 
 ## Sunshine / Moonlight Notes
 - Reference implementation source is `/home/wangkai/github/Sunshine`.
-- One-KVM source for the compatibility layer is `/home/wangkai/github/yocto/one-kvm/src/sunshine.rs`.
+- One-KVM source for the compatibility layer is `/home/wangkai/github/vim4/one-kvm/src/sunshine.rs`.
 - Moonlight/GameStream is not plain RTSP. It needs NVHTTP discovery/control, PIN pairing, client certificate storage/verification, launch session creation, encrypted RTSP support, encrypted control/input, and RTP media transport.
 - Current One-KVM Sunshine work implements NVHTTP HTTP/HTTPS, mDNS `_nvstream._tcp.local`, `/serverinfo`, PIN pairing, `/applist`, `/launch`, `/resume`, `/cancel`, and paired-client state under `/etc/one-kvm/sunshine`.
 - Current GameStream prototype also implements RTSP on TCP 48010, video RTP over UDP 47998, ENet control/input over UDP 47999 using `libs/rusty_enet`, and exposes one app named `HDMI Input`.
-- Do not edit `build/tmp/work/.../one-kvm/...` directly. Make Moonlight/Sunshine changes in `/home/wangkai/github/yocto/one-kvm`, then rebuild with Docker/BitBake.
+- Do not edit `build/tmp/work/.../one-kvm/...` directly. Make Moonlight/Sunshine changes in `/home/wangkai/github/vim4/one-kvm`, then rebuild with Docker/BitBake.
 - `Cargo.toml` currently uses a local `rusty_enet` path dependency: `libs/rusty_enet`.
 - `/serverinfo` must return `PairStatus=0` unless the Moonlight `uniqueid` is present in the saved paired-client list. Returning `1` just because a `uniqueid` query parameter exists makes Moonlight skip PIN pairing incorrectly.
 - `/applist` should expose a real app, currently `HDMI Input` with `ID=1` and `SupportedSOPS` entries including 3840x2160@60 and 1920x1080@120.
