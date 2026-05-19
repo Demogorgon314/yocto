@@ -8,16 +8,13 @@ integration and image-build workspace.
 
 - Root: `/home/wangkai/github/vim4`
 - Image-build workspace: `/home/wangkai/github/yocto`
-- Legacy local build directory: `/home/wangkai/github/vim4/build`
-- Legacy downloads: `/home/wangkai/github/vim4/downloads`
-- Legacy sstate cache: `/home/wangkai/github/vim4/sstate-cache`
 - Main VIM4 machine/config: `mesont7c-kvim4-5.15`
 - Main image recipe: `amlogic-yocto`
 
-This checkout includes the submodules needed for feature development. If
-changing a submodule, make the branch inside that submodule and commit there
-first. Then update the integration/build workspace in
-`/home/wangkai/github/yocto` to consume the pushed revision.
+This checkout only keeps the forked repositories used for feature development.
+If changing a submodule, make the branch inside that submodule and commit there
+first. Then update the integration/build workspace in `/home/wangkai/github/yocto`
+to consume the pushed revision.
 For active development modules, keep `origin` pointed at the Demogorgon314 fork
 and avoid keeping a writable upstream remote in this checkout.
 
@@ -27,7 +24,6 @@ and avoid keeping a writable upstream remote in this checkout.
 - Kernel common drivers: `aml-comp/kernel/aml-5.15/common_drivers`
 - Media modules: `aml-comp/kernel/aml-5.15/common_drivers/drivers/media_modules`
 - One-KVM source: `one-kvm`
-- U-Boot: `aml-comp/uboot`
 - Khadas custom package: `meta-meson/recipes-khadas/khadas-custom`
 - VIM4 image recipe layer: `meta-aml-cfg/recipes-core/images`
 
@@ -61,9 +57,9 @@ Do not reset or discard these unless explicitly requested.
 ## Build
 
 Build full images from `/home/wangkai/github/yocto`. Treat this `vim4`
-checkout as the source-development workspace; it still has legacy build,
-downloads, and sstate directories from earlier experiments, but they are not
-the canonical image-build location.
+checkout as the source-development workspace only. Build artifacts, downloads,
+sstate cache, upstream-only Yocto layers, U-Boot, and prebuilt/vendor trees were
+removed from this checkout intentionally.
 
 Canonical VIM4 image build:
 
@@ -89,23 +85,6 @@ Main outputs from that build:
 
 - `vim4-yocto-260519.img`
 - `vim4-yocto-260519.img.xz`
-- `software.swu`
-- `boot.img`
-- `recovery.img`
-- `vendor.ext4.img2simg`
-
-Last known successful legacy build in this checkout:
-
-- Date: 2026-05-17
-- Result: `7874` tasks attempted, all succeeded
-- Warnings: `44`
-- Deploy directory:
-  `/home/wangkai/github/vim4/build/tmp/deploy/images/mesont7c-kvim4-5.15`
-
-Main outputs from that build:
-
-- `vim4-yocto-260517.img`
-- `vim4-yocto-260517.img.xz`
 - `software.swu`
 - `boot.img`
 - `recovery.img`
