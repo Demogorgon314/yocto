@@ -292,3 +292,7 @@
 [submodule "document"]
 	path = document
 	url = git@github.com:aml-streambox/document.git
+[submodule "one-kvm"]
+	path = one-kvm
+	url = git@github.com:Demogorgon314/One-KVM-StreamBox.git
+	branch = sync-upstream-main
