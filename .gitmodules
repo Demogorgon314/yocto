@@ -3,7 +3,7 @@
 	url = git@github.com:aml-streambox/meta-gplv2.git
 [submodule "meta-aml-cfg"]
 	path = meta-aml-cfg
-	url = git@github.com:aml-streambox/meta-aml-cfg.git
+	url = git@github.com:Demogorgon314/meta-aml-cfg.git
 [submodule "meta-openembedded"]
 	path = meta-openembedded
 	url = git@github.com:aml-streambox/meta-openembedded.git
@@ -24,7 +24,7 @@
 	url = git@github.com:aml-streambox/meta-qt5.git
 [submodule "meta-meson"]
 	path = meta-meson
-	url = git@github.com:aml-streambox/meta-meson.git
+	url = git@github.com:Demogorgon314/meta-meson.git
 [submodule "aml-comp/vendor/amlogic/bluez-alsa"]
 	path = aml-comp/vendor/amlogic/bluez-alsa
 	url = git@github.com:aml-streambox/bluez-alsa.git
@@ -282,7 +282,7 @@
 	url = git@github.com:aml-streambox/bt-realtek.git
 [submodule "aml-comp/kernel/aml-5.15"]
 	path = aml-comp/kernel/aml-5.15
-	url = git@github.com:aml-streambox/aml-5.15.git
+	url = git@github.com:Demogorgon314/aml-5.15.git
 [submodule "aml-comp/kernel/aml-5.4"]
 	path = aml-comp/kernel/aml-5.4
 	url = git@github.com:aml-streambox/aml-5.4.git

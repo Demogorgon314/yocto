@@ -15,6 +15,8 @@ This workspace is for local VIM4 Yocto development. Keep changes here under
 
 This checkout includes the submodules needed for development. If changing a
 submodule, make the branch inside that submodule and commit there first.
+For active development modules, keep `origin` pointed at the Demogorgon314 fork
+and avoid keeping a writable upstream remote in this checkout.
 
 ## Important Source Locations
 
@@ -25,6 +27,15 @@ submodule, make the branch inside that submodule and commit there first.
 - U-Boot: `aml-comp/uboot`
 - Khadas custom package: `meta-meson/recipes-khadas/khadas-custom`
 - VIM4 image recipe layer: `meta-aml-cfg/recipes-core/images`
+
+Active fork remotes:
+
+- Top-level workspace: `git@github.com:Demogorgon314/yocto.git`
+- Kernel: `git@github.com:Demogorgon314/aml-5.15.git`
+- Kernel common drivers: `git@github.com:Demogorgon314/common_drivers.git`
+- Meta Amlogic config: `git@github.com:Demogorgon314/meta-aml-cfg.git`
+- Meta Meson: `git@github.com:Demogorgon314/meta-meson.git`
+- One-KVM: `git@github.com:Demogorgon314/One-KVM-StreamBox.git`
 
 ## One-KVM Development
 
