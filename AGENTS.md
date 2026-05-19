@@ -21,9 +21,19 @@ submodule, make the branch inside that submodule and commit there first.
 - Kernel: `aml-comp/kernel/aml-5.15`
 - Kernel common drivers: `aml-comp/kernel/aml-5.15/common_drivers`
 - Media modules: `aml-comp/kernel/aml-5.15/common_drivers/drivers/media_modules`
+- One-KVM source: `one-kvm`
 - U-Boot: `aml-comp/uboot`
 - Khadas custom package: `meta-meson/recipes-khadas/khadas-custom`
 - VIM4 image recipe layer: `meta-aml-cfg/recipes-core/images`
+
+## One-KVM Development
+
+- Local source: `/home/wangkai/github/vim4/one-kvm`
+- Fork remote: `git@github.com:Demogorgon314/One-KVM-StreamBox.git`
+- Current development branch: `sync-upstream-main`
+- After changing One-KVM, commit and push from this submodule first. Then
+  update the Yocto integration recipe/SRCREV in `/home/wangkai/github/yocto`
+  for image builds.
 
 Known inherited submodule dirtiness from the original checkout:
 
