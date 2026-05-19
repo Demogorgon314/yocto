@@ -1,20 +1,23 @@
 # AGENTS.md
 
-This workspace is for local VIM4 Yocto development. Keep changes here under
-`/home/wangkai/github/vim4`; the original checkout under
-`/home/wangkai/github/yocto` should be treated as the reference copy.
+This workspace is for VIM4 feature development. Keep source changes here under
+`/home/wangkai/github/vim4`; use `/home/wangkai/github/yocto` as the Yocto
+integration and image-build workspace.
 
 ## Workspace
 
 - Root: `/home/wangkai/github/vim4`
-- Build directory: `/home/wangkai/github/vim4/build`
-- Downloads: `/home/wangkai/github/vim4/downloads`
-- Sstate cache: `/home/wangkai/github/vim4/sstate-cache`
+- Image-build workspace: `/home/wangkai/github/yocto`
+- Legacy local build directory: `/home/wangkai/github/vim4/build`
+- Legacy downloads: `/home/wangkai/github/vim4/downloads`
+- Legacy sstate cache: `/home/wangkai/github/vim4/sstate-cache`
 - Main VIM4 machine/config: `mesont7c-kvim4-5.15`
 - Main image recipe: `amlogic-yocto`
 
-This checkout includes the submodules needed for development. If changing a
-submodule, make the branch inside that submodule and commit there first.
+This checkout includes the submodules needed for feature development. If
+changing a submodule, make the branch inside that submodule and commit there
+first. Then update the integration/build workspace in
+`/home/wangkai/github/yocto` to consume the pushed revision.
 For active development modules, keep `origin` pointed at the Demogorgon314 fork
 and avoid keeping a writable upstream remote in this checkout.
 
@@ -57,14 +60,16 @@ Do not reset or discard these unless explicitly requested.
 
 ## Build
 
-The host shell build currently fails because the environment script expects
-`python` to be Python 2. Use the provided Docker builder image instead.
+Build full images from `/home/wangkai/github/yocto`. Treat this `vim4`
+checkout as the source-development workspace; it still has legacy build,
+downloads, and sstate directories from earlier experiments, but they are not
+the canonical image-build location.
 
-Build only VIM4:
+Canonical VIM4 image build:
 
 ```sh
 docker run --rm \
-  -v /home/wangkai/github/vim4:/workspace \
+  -v /home/wangkai/github/yocto:/workspace \
   -w /workspace \
   -e LOCAL_UID=$(id -u) \
   -e LOCAL_GID=$(id -g) \
@@ -72,7 +77,24 @@ docker run --rm \
   /bin/bash -lc 'source meta-meson/aml-setenv.sh mesont7c-kvim4-5.15 && bitbake amlogic-yocto'
 ```
 
-Last known successful VIM4 development build in this checkout:
+Last known successful VIM4 build in `/home/wangkai/github/yocto`:
+
+- Date: 2026-05-19
+- Result: `7917` tasks attempted, all succeeded
+- Warnings: `20`
+- Deploy directory:
+  `/home/wangkai/github/yocto/build/tmp/deploy/images/mesont7c-kvim4-5.15`
+
+Main outputs from that build:
+
+- `vim4-yocto-260519.img`
+- `vim4-yocto-260519.img.xz`
+- `software.swu`
+- `boot.img`
+- `recovery.img`
+- `vendor.ext4.img2simg`
+
+Last known successful legacy build in this checkout:
 
 - Date: 2026-05-17
 - Result: `7874` tasks attempted, all succeeded
