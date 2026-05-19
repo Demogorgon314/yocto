@@ -61,7 +61,7 @@ docker run --rm \
   /bin/bash -lc 'source meta-meson/aml-setenv.sh mesont7c-kvim4-5.15 && bitbake amlogic-yocto'
 ```
 
-Last known successful build:
+Last known successful VIM4 development build in this checkout:
 
 - Date: 2026-05-17
 - Result: `7874` tasks attempted, all succeeded
@@ -137,14 +137,13 @@ Measured VIM4 fan behavior:
 
 The local automatic mode uses the percent interface on VIM4/VIM1S instead of
 the old four-step `0/low/mid/high` mapping. With the default trigger
-temperatures (`level0=60`, `level1=80`, `level2=100`), the current curve is:
+temperatures (`level0=50`, `level1=60`, `level2=70`), the current curve is:
 
 - `<45C`: `0%`
 - `45C..55C`: `5%..25%`
 - `55C..60C`: `25%..35%`
-- `60C..80C`: `35%..70%`
-- `80C..100C`: `70%..100%`
-- `>=100C`: `100%`
+- `60C..70C`: `35%..100%`
+- `>=70C`: `100%`
 
 Auto mode also limits speed changes to `5%` per fan work cycle, except when
 starting from or dropping to `0%`.
@@ -152,6 +151,18 @@ starting from or dropping to `0%`.
 Kernel implementation:
 
 - `aml-comp/kernel/aml-5.15/drivers/misc/khadas-mcu.c`
+
+Verified board behavior after flashing the full
+`vim4-yocto-260519.img` image:
+
+- `/sys/class/fan/speed` exists.
+- Board module contains `mcu_fan_auto_speed_percent`.
+- At about `51C`, auto mode reported `Fan speed: 15`.
+- The module hash was
+  `efe988fa58ea12dcd4a50c013d445100d8a739619c65eb7df9c9b60a608c2298`.
+
+The `software.swu` update previously did not replace the running
+`khadas-mcu.ko` on the tested board; flashing the full image did.
 
 VIM4 fan levels map to MCU register values in that driver:
 
