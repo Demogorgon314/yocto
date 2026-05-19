@@ -67,6 +67,14 @@
 - Board IP used for local testing: `192.168.172.1`
 - The same board may also appear on the upstream Wi-Fi as `192.168.50.156`; Moonlight mDNS may prefer that address.
 - SSH user/password: `root` / `Streamb0x`
+- Latest verified full image from this workspace:
+  `build/tmp/deploy/images/mesont7c-kvim4-5.15/vim4-yocto-260519.img`
+- After flashing that full image, the VIM4 fan percent interface was present
+  at `/sys/class/fan/speed`; at about `51C`, auto mode reported
+  `Fan speed: 15`.
+- The earlier `software.swu` test did not replace the running
+  `khadas-mcu.ko` on the tested board. Use the full `.img` when validating
+  kernel/module changes unless SWU module replacement has been verified.
 - Quick install:
   ```sh
   sshpass -p Streamb0x scp -o StrictHostKeyChecking=no build/tmp/deploy/ipk/armv8a/one-kvm_git-r0_armv8a.ipk root@192.168.172.1:/tmp/one-kvm_git-r0_armv8a.ipk
