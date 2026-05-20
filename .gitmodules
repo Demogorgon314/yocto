@@ -24,7 +24,7 @@
 	url = git@github.com:aml-streambox/meta-qt5.git
 [submodule "meta-meson"]
 	path = meta-meson
-	url = git@github.com:aml-streambox/meta-meson.git
+	url = git@github.com:Demogorgon314/meta-meson.git
 [submodule "aml-comp/vendor/amlogic/bluez-alsa"]
 	path = aml-comp/vendor/amlogic/bluez-alsa
 	url = git@github.com:aml-streambox/bluez-alsa.git
