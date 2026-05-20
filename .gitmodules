@@ -3,7 +3,7 @@
 	url = git@github.com:aml-streambox/meta-gplv2.git
 [submodule "meta-aml-cfg"]
 	path = meta-aml-cfg
-	url = git@github.com:aml-streambox/meta-aml-cfg.git
+	url = git@github.com:Demogorgon314/meta-aml-cfg.git
 [submodule "meta-openembedded"]
 	path = meta-openembedded
 	url = git@github.com:aml-streambox/meta-openembedded.git
