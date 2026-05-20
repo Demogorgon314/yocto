@@ -1,19 +1,20 @@
 # AGENTS.md
 
 This workspace is for VIM4 feature development. Keep source changes here under
-`/home/wangkai/github/vim4`; use `/home/wangkai/github/yocto` as the Yocto
-integration and image-build workspace.
+`/home/wangkai/github/yocto-dev/forks`; use
+`/home/wangkai/github/yocto-dev/build` as the Yocto integration and image-build
+workspace.
 
 ## Workspace
 
-- Root: `/home/wangkai/github/vim4`
-- Image-build workspace: `/home/wangkai/github/yocto`
+- Root: `/home/wangkai/github/yocto-dev/forks`
+- Image-build workspace: `/home/wangkai/github/yocto-dev/build`
 - Main VIM4 machine/config: `mesont7c-kvim4-5.15`
 - Main image recipe: `amlogic-yocto`
 
 This checkout only keeps the forked repositories used for feature development.
 If changing a submodule, make the branch inside that submodule and commit there
-first. Then update the integration/build workspace in `/home/wangkai/github/yocto`
+first. Then update the integration/build workspace in `/home/wangkai/github/yocto-dev/build`
 to consume the pushed revision.
 For active development modules, keep `origin` pointed at the Demogorgon314 fork
 and avoid keeping a writable upstream remote in this checkout.
@@ -38,11 +39,11 @@ Active fork remotes:
 
 ## One-KVM Development
 
-- Local source: `/home/wangkai/github/vim4/one-kvm`
+- Local source: `/home/wangkai/github/yocto-dev/forks/one-kvm`
 - Fork remote: `git@github.com:Demogorgon314/One-KVM-StreamBox.git`
 - Current development branch: `sync-upstream-main`
 - After changing One-KVM, commit and push from this submodule first. Then
-  update the Yocto integration recipe/SRCREV in `/home/wangkai/github/yocto`
+  update the Yocto integration recipe/SRCREV in `/home/wangkai/github/yocto-dev/build`
   for image builds.
 
 Known inherited submodule dirtiness from the original checkout:
@@ -56,7 +57,7 @@ Do not reset or discard these unless explicitly requested.
 
 ## Build
 
-Build full images from `/home/wangkai/github/yocto`. Treat this `vim4`
+Build full images from `/home/wangkai/github/yocto-dev/build`. Treat this `forks`
 checkout as the source-development workspace only. Build artifacts, downloads,
 sstate cache, upstream-only Yocto layers, U-Boot, and prebuilt/vendor trees were
 removed from this checkout intentionally.
@@ -65,7 +66,7 @@ Canonical VIM4 image build:
 
 ```sh
 docker run --rm \
-  -v /home/wangkai/github/yocto:/workspace \
+  -v /home/wangkai/github/yocto-dev/build:/workspace \
   -w /workspace \
   -e LOCAL_UID=$(id -u) \
   -e LOCAL_GID=$(id -g) \
@@ -73,13 +74,13 @@ docker run --rm \
   /bin/bash -lc 'source meta-meson/aml-setenv.sh mesont7c-kvim4-5.15 && bitbake amlogic-yocto'
 ```
 
-Last known successful VIM4 build in `/home/wangkai/github/yocto`:
+Last known successful VIM4 build in `/home/wangkai/github/yocto-dev/build`:
 
 - Date: 2026-05-19
 - Result: `7917` tasks attempted, all succeeded
 - Warnings: `20`
 - Deploy directory:
-  `/home/wangkai/github/yocto/build/tmp/deploy/images/mesont7c-kvim4-5.15`
+  `/home/wangkai/github/yocto-dev/build/build/tmp/deploy/images/mesont7c-kvim4-5.15`
 
 Main outputs from that build:
 
